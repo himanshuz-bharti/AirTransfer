@@ -25,6 +25,8 @@ import java.util.concurrent.Executors;
 import com.example.myapplication.camera.FrameData;
 import com.example.myapplication.camera.FrameProcessor;
 
+import com.example.myapplication.camera.PerformaneMonitor;
+
 
 public class MainActivity extends AppCompatActivity {
 
@@ -35,12 +37,16 @@ public class MainActivity extends AppCompatActivity {
     private FrameProcessor frameProcessor;
     private PreviewView viewFinder;
     private ExecutorService cameraExecutor;
+
+    private PerformaneMonitor performanceMonitor;
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
         frameProcessor = new FrameProcessor();
+
+        performanceMonitor = new PerformaneMonitor();
 
         viewFinder = findViewById(R.id.viewFinder);
 
@@ -67,9 +73,14 @@ public class MainActivity extends AppCompatActivity {
                 ImageAnalysis imageAnalysis = new ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build();
 
                 imageAnalysis.setAnalyzer(cameraExecutor,image ->{
+
+                    long frameStartTime = System.nanoTime();
                     try{
                         FrameData data = frameProcessor.processFrame(image);
-                        Log.i(TAG,"width:"+ data.getWidth() + " height:"+ data.getheight()+ " rotationdegree:"+ data.getrotationDegree() + " timestamp:"+ data.getTimeStamp());
+                        performanceMonitor.onFrameEnd(frameStartTime);
+                        Log.i(TAG,"width:"+ data.getWidth() + " height:"+ data.getheight()+ " rotationdegree:"+ data.getrotationDegree() + " timestamp:"+ data.getTimeStamp()
+                        +" FPS:" + performanceMonitor.getfps() + " lastframetimems:"+ performanceMonitor.getLastFrameTimeMs());
+
                     }
                     finally {
                         image.close();
