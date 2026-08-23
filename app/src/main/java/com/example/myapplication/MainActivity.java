@@ -4,6 +4,7 @@ import android.Manifest;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.util.Log;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
@@ -16,9 +17,12 @@ import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+import com.example.myapplication.frame.FrameCorners;
+import com.example.myapplication.frame.FrameDetector;
 import com.example.myapplication.vision.HandLandMark;
 import com.google.common.util.concurrent.ListenableFuture;
 
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -30,8 +34,10 @@ import com.example.myapplication.camera.PerformaneMonitor;
 import com.example.myapplication.ui.OverlayView;
 
 import android.graphics.Bitmap;
+import android.graphics.Matrix;
 
 import com.example.myapplication.camera.ImageConverter;
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
 
@@ -47,6 +53,8 @@ public class MainActivity extends AppCompatActivity {
     private ExecutorService cameraExecutor;
     private HandLandMark handlandmark;
     private PerformaneMonitor performanceMonitor;
+
+    private FrameDetector frameDetector;
     private OverlayView overlayView;
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -61,10 +69,12 @@ public class MainActivity extends AppCompatActivity {
 
         overlayView = findViewById(R.id.overlayView);
 
+        frameDetector = new FrameDetector();
+
         handlandmark = new HandLandMark(this,
                 new HandLandMark.ResultListener() {
                     @Override
-                    public void onResult(HandLandmarkerResult result,int imageWidth,int imageHeight) {
+                    public void onResult(HandLandmarkerResult result,int imageWidth,int imageHeight,int rotationDegrees) {
                         Log.d(
                                 TAG,
                                 "MediaPipe image = "
@@ -76,7 +86,10 @@ public class MainActivity extends AppCompatActivity {
                                         + "x"
                                         + overlayView.getHeight()
                         );
-                        overlayView.setResult(result.landmarks(),imageWidth,imageHeight);
+
+                        FrameCorners frameCorners = frameDetector.detect(result);
+                        overlayView.setResult(result.landmarks(),imageWidth,imageHeight,rotationDegrees);
+                        overlayView.setFrameCorners(frameCorners);
                     }
 
                     @Override
@@ -124,7 +137,18 @@ public class MainActivity extends AppCompatActivity {
                         Bitmap bitmap = ImageConverter.toBitmap(image);
 
                         long timestampMs = image.getImageInfo().getTimestamp()/1_000_000L;
-                        handlandmark.detectAsync(bitmap,timestampMs);
+
+                        int rotationDegrees = image.getImageInfo().getRotationDegrees();
+
+                        // Rotate to upright + mirror horizontally (front camera)
+                        // so MediaPipe works in the same orientation as the preview
+                        Matrix matrix = new Matrix();
+                        matrix.postRotate(rotationDegrees);
+                        matrix.postScale(-1f, 1f);
+                        bitmap = Bitmap.createBitmap(bitmap, 0, 0,
+                                bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+
+                        handlandmark.detectAsync(bitmap,timestampMs,0);
 
                         performanceMonitor.onFrameEnd(frameStartTime);
                         Log.i(TAG,"width:"+ data.getWidth() + " height:"+ data.getheight()+ " rotationdegree:"+ data.getrotationDegree() + " timestamp:"+ data.getTimeStamp()

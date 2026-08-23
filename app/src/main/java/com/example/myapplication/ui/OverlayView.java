@@ -4,8 +4,12 @@ import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.util.AttributeSet;
+import android.util.Log;
 import android.view.View;
 import  android.graphics.Paint;
+
+import com.example.myapplication.frame.FrameCorners;
+import com.example.myapplication.frame.FramePoint;
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 
 
@@ -15,6 +19,8 @@ import java.util.List;
 
 
 public class OverlayView extends View{
+
+    private static String TAG = "OverlayView";
 
     private static final int[][] CONNECTIONS = {
 
@@ -60,6 +66,13 @@ public class OverlayView extends View{
     private int imageWidth;
     private int imageHeight;
 
+    private int rotationDegrees;
+
+    private FrameCorners frameCorners;
+
+    private FramePoint framePoint;
+    private final Paint framePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
     public OverlayView(Context context){
         this(context,null);
     }
@@ -75,68 +88,113 @@ public class OverlayView extends View{
 
         pointPaint.setStrokeWidth(8f);
         linePaint.setStrokeWidth(5f);
+
+        framePaint.setStyle(Paint.Style.STROKE);
+        framePaint.setStrokeWidth(8f);
+        framePaint.setColor(Color.CYAN);
     }
 
-    public void setResult(List<List<NormalizedLandmark>> hands,int imageWidth,int imageHeight){
+    public void setResult(List<List<NormalizedLandmark>> hands,int imageWidth,int imageHeight,int rotationDegrees){
         this.hands = hands;
         this.imageWidth = imageWidth;
         this.imageHeight = imageHeight;
+        this.rotationDegrees = rotationDegrees;
+        Log.d(
+               TAG, "rotation = " + rotationDegrees
+        );
+        postInvalidate();
+    }
+
+    public void setFrameCorners(FrameCorners frameCorners){
+        this.frameCorners = frameCorners;
         postInvalidate();
     }
 
     @Override
     protected void onDraw(Canvas canvas){
         super.onDraw(canvas);
-        if(hands == null) return;
+        if(imageWidth == 0 || imageHeight == 0) return;
 
-        for (List<NormalizedLandmark> hand : hands) {
+        // fillCenter (cover) scaling - must match PreviewView scaleType
+        float scaleX = getWidth() / (float) imageWidth;
+        float scaleY = getHeight() / (float) imageHeight;
+        float scale = Math.max(scaleX, scaleY);
 
-            // Draw connections
-            for (int[] connection : CONNECTIONS) {
+        float offsetX = (getWidth() - imageWidth * scale) / 2f;
+        float offsetY = (getHeight() - imageHeight * scale) / 2f;
 
-                NormalizedLandmark start =
-                        hand.get(connection[0]);
+        if(hands != null) {
+            for (List<NormalizedLandmark> hand : hands) {
 
-                NormalizedLandmark end =
-                        hand.get(connection[1]);
+                for (int[] connection : CONNECTIONS) {
 
-                float startX =
-                        start.x() * getWidth();
+                    NormalizedLandmark start =
+                            hand.get(connection[0]);
 
-                float startY =
-                        start.y() * getHeight();
+                    NormalizedLandmark end =
+                            hand.get(connection[1]);
 
-                float endX =
-                        end.x() * getWidth();
+                    float startX = start.x() * imageWidth * scale + offsetX;
+                    float startY = start.y() * imageHeight * scale + offsetY;
+                    float endX = end.x() * imageWidth * scale + offsetX;
+                    float endY = end.y() * imageHeight * scale + offsetY;
 
-                float endY =
-                        end.y() * getHeight();
+                    canvas.drawLine(
+                            startX,
+                            startY,
+                            endX,
+                            endY,
+                            linePaint
+                    );
+                }
 
-                canvas.drawLine(
-                        startX,
-                        startY,
-                        endX,
-                        endY,
-                        linePaint
-                );
-            }
+                for (NormalizedLandmark landmark : hand) {
 
-            // Draw landmark points
-            for (NormalizedLandmark landmark : hand) {
+                    float x = landmark.x() * imageWidth * scale + offsetX;
+                    float y = landmark.y() * imageHeight * scale + offsetY;
 
-                float x =
-                        landmark.x() * getWidth();
+                    canvas.drawCircle(
+                            x,
+                            y,
+                            10f,
+                            pointPaint
+                    );
+                }
 
-                float y =
-                        landmark.y() * getHeight();
 
-                canvas.drawCircle(
-                        x,
-                        y,
-                        10f,
-                        pointPaint
-                );
             }
         }
+
+        drawFrameRectangle(canvas, scale, offsetX, offsetY);
+    }
+
+    private void drawFrameRectangle(Canvas canvas,float scale,float offsetX,float offsetY){
+        if(frameCorners == null) return;
+
+        FramePoint topleft = frameCorners.getTopleft();
+        FramePoint topright = frameCorners.getTopright();
+        FramePoint bottomright = frameCorners.getBottomright();
+        FramePoint bottomleft = frameCorners.getBottomleft();
+
+        if(topleft == null || topright == null ||
+           bottomright == null || bottomleft == null) return;
+
+        float tlx = topleft.x * imageWidth * scale + offsetX;
+        float tly = topleft.y * imageHeight * scale + offsetY;
+
+        float trx = topright.x * imageWidth * scale + offsetX;
+        float try_ = topright.y * imageHeight * scale + offsetY;
+
+        float brx = bottomright.x * imageWidth * scale + offsetX;
+        float bry = bottomright.y * imageHeight * scale + offsetY;
+
+        float blx = bottomleft.x * imageWidth * scale + offsetX;
+        float bly = bottomleft.y * imageHeight * scale + offsetY;
+
+        // Clockwise: topleft -> topright -> bottomright -> bottomleft -> close
+        canvas.drawLine(tlx, tly, trx, try_, framePaint);
+        canvas.drawLine(trx, try_, brx, bry, framePaint);
+        canvas.drawLine(brx, bry, blx, bly, framePaint);
+        canvas.drawLine(blx, bly, tlx, tly, framePaint);
     }
 }

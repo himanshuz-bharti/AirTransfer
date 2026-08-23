@@ -16,8 +16,10 @@ import com.google.mediapipe.framework.image.MPImage;
 public class HandLandMark {
     private static final String TAG = "HandLandMark";
     private final HandLandmarker handLandmarker;
+
+    private volatile int lastRotationdegrees;
     public interface ResultListener{
-        void onResult(HandLandmarkerResult result,int imageWidth,int imageHeight);
+        void onResult(HandLandmarkerResult result,int imageWidth,int imageHeight,int roationDegrees);
         void onError(RuntimeException error);
     }
 
@@ -44,7 +46,7 @@ public class HandLandMark {
         Log.d(TAG,"hand detected" + resultsize);
 
         if(resultsize==0) return;
-        resultlistener.onResult(result, input.getWidth(), input.getHeight());
+        resultlistener.onResult(result, input.getWidth(), input.getHeight(),lastRotationdegrees);
 //        for(int handidx=0;handidx<resultsize;handidx++){
 //            var landmarks = result.landmarks().get(handidx);
 //            Log.d(TAG, "hand idx:" + handidx + " landmarks size "+landmarks.size());
@@ -60,8 +62,9 @@ public class HandLandMark {
         resultlistener.onError(error);
     }
 
-    public void detectAsync(Bitmap bitmap,long timestamp){
+    public void detectAsync(Bitmap bitmap,long timestamp,int rotationDegrees){
         MPImage mpImage = new BitmapImageBuilder(bitmap).build();
+        lastRotationdegrees = rotationDegrees;
         handLandmarker.detectAsync(mpImage,timestamp);
     }
 
