@@ -27,11 +27,13 @@ import com.example.myapplication.camera.FrameData;
 import com.example.myapplication.camera.FrameProcessor;
 
 import com.example.myapplication.camera.PerformaneMonitor;
+import com.example.myapplication.ui.OverlayView;
 
 import android.graphics.Bitmap;
 
 import com.example.myapplication.camera.ImageConverter;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
 
 
 public class MainActivity extends AppCompatActivity {
@@ -43,10 +45,9 @@ public class MainActivity extends AppCompatActivity {
     private FrameProcessor frameProcessor;
     private PreviewView viewFinder;
     private ExecutorService cameraExecutor;
-
     private HandLandMark handlandmark;
-
     private PerformaneMonitor performanceMonitor;
+    private OverlayView overlayView;
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -58,7 +59,35 @@ public class MainActivity extends AppCompatActivity {
 
         viewFinder = findViewById(R.id.viewFinder);
 
-        handlandmark = new HandLandMark(this);
+        overlayView = findViewById(R.id.overlayView);
+
+        handlandmark = new HandLandMark(this,
+                new HandLandMark.ResultListener() {
+                    @Override
+                    public void onResult(HandLandmarkerResult result,int imageWidth,int imageHeight) {
+                        Log.d(
+                                TAG,
+                                "MediaPipe image = "
+                                        + imageWidth
+                                        + "x"
+                                        + imageHeight
+                                        + " | Overlay = "
+                                        + overlayView.getWidth()
+                                        + "x"
+                                        + overlayView.getHeight()
+                        );
+                        overlayView.setResult(result.landmarks(),imageWidth,imageHeight);
+                    }
+
+                    @Override
+                    public void onError(RuntimeException error) {
+                        Log.e(
+                                TAG,
+                                "MediaPipe error",
+                                error
+                        );
+                    }
+                });
 
         cameraExecutor = Executors.newSingleThreadExecutor();
         if(allRequiredPermissions()){

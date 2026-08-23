@@ -16,8 +16,13 @@ import com.google.mediapipe.framework.image.MPImage;
 public class HandLandMark {
     private static final String TAG = "HandLandMark";
     private final HandLandmarker handLandmarker;
+    public interface ResultListener{
+        void onResult(HandLandmarkerResult result,int imageWidth,int imageHeight);
+        void onError(RuntimeException error);
+    }
 
-    public HandLandMark(Context context) {
+    private final ResultListener resultlistener;
+    public HandLandMark(Context context,ResultListener resultlistener) {
         BaseOptions baseoptions = BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build();
         HandLandmarker.HandLandmarkerOptions options =  HandLandmarker.HandLandmarkerOptions.builder()
                 .setBaseOptions(baseoptions)
@@ -31,6 +36,7 @@ public class HandLandMark {
                 .build();
 
         handLandmarker = HandLandmarker.createFromOptions(context,options);
+        this.resultlistener = resultlistener;
     }
 
     private void onHandLandmarkerResult(HandLandmarkerResult result, MPImage input){
@@ -38,18 +44,20 @@ public class HandLandMark {
         Log.d(TAG,"hand detected" + resultsize);
 
         if(resultsize==0) return;
-        for(int handidx=0;handidx<resultsize;handidx++){
-            var landmarks = result.landmarks().get(handidx);
-            Log.d(TAG, "hand idx:" + handidx + " landmarks size "+landmarks.size());
-            for(int j=0;j<landmarks.size();j++){
-                var landmark = landmarks.get(j);
-                Log.d(TAG," handidx: "+ handidx + " point " + j + " x= " + landmark.x() + " y= " + landmark.y() + " z= " + landmark.z());
-            }
-        }
+        resultlistener.onResult(result, input.getWidth(), input.getHeight());
+//        for(int handidx=0;handidx<resultsize;handidx++){
+//            var landmarks = result.landmarks().get(handidx);
+//            Log.d(TAG, "hand idx:" + handidx + " landmarks size "+landmarks.size());
+//            for(int j=0;j<landmarks.size();j++){
+//                var landmark = landmarks.get(j);
+//                Log.d(TAG," handidx: "+ handidx + " point " + j + " x= " + landmark.x() + " y= " + landmark.y() + " z= " + landmark.z());
+//            }
+//        }
     }
 
     private void onHandLandmarkerError(RuntimeException error) {
         Log.e(TAG, "Hand Landmarker error: " + error.getMessage());
+        resultlistener.onError(error);
     }
 
     public void detectAsync(Bitmap bitmap,long timestamp){
