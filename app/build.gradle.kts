@@ -51,6 +51,7 @@ dependencies {
         implementation("androidx.camera:camera-camera2:$cameraxVersion")
         implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
         implementation("androidx.camera:camera-view:$cameraxVersion")
+        implementation("com.google.mediapipe:tasks-vision:0.10.29")
 
         // Google AI Edge MediaPipe Vision
         implementation("com.google.mediapipe:tasks-vision:0.10.14")

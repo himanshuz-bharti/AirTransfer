@@ -16,6 +16,7 @@ import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+import com.example.myapplication.vision.HandLandMark;
 import com.google.common.util.concurrent.ListenableFuture;
 
 import java.util.concurrent.ExecutionException;
@@ -26,6 +27,11 @@ import com.example.myapplication.camera.FrameData;
 import com.example.myapplication.camera.FrameProcessor;
 
 import com.example.myapplication.camera.PerformaneMonitor;
+
+import android.graphics.Bitmap;
+
+import com.example.myapplication.camera.ImageConverter;
+import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
 
 
 public class MainActivity extends AppCompatActivity {
@@ -38,6 +44,8 @@ public class MainActivity extends AppCompatActivity {
     private PreviewView viewFinder;
     private ExecutorService cameraExecutor;
 
+    private HandLandMark handlandmark;
+
     private PerformaneMonitor performanceMonitor;
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -49,6 +57,8 @@ public class MainActivity extends AppCompatActivity {
         performanceMonitor = new PerformaneMonitor();
 
         viewFinder = findViewById(R.id.viewFinder);
+
+        handlandmark = new HandLandMark(this);
 
         cameraExecutor = Executors.newSingleThreadExecutor();
         if(allRequiredPermissions()){
@@ -70,7 +80,10 @@ public class MainActivity extends AppCompatActivity {
                 Preview preview = new Preview.Builder().build();
                 preview.setSurfaceProvider(viewFinder.getSurfaceProvider());
 
-                ImageAnalysis imageAnalysis = new ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build();
+                ImageAnalysis imageAnalysis = new ImageAnalysis.Builder().
+                        setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                        .build();
 
                 imageAnalysis.setAnalyzer(cameraExecutor,image ->{
 
@@ -78,8 +91,22 @@ public class MainActivity extends AppCompatActivity {
                     try{
                         FrameData data = frameProcessor.processFrame(image);
                         performanceMonitor.onFrameEnd(frameStartTime);
+
+                        Bitmap bitmap = ImageConverter.toBitmap(image);
+
+                        long timestampMs = image.getImageInfo().getTimestamp()/1_000_000L;
+                        handlandmark.detectAsync(bitmap,timestampMs);
+
+                        performanceMonitor.onFrameEnd(frameStartTime);
                         Log.i(TAG,"width:"+ data.getWidth() + " height:"+ data.getheight()+ " rotationdegree:"+ data.getrotationDegree() + " timestamp:"+ data.getTimeStamp()
-                        +" FPS:" + performanceMonitor.getfps() + " lastframetimems:"+ performanceMonitor.getLastFrameTimeMs());
+                                +" FPS:" + performanceMonitor.getfps() + " lastframetimems:"+ performanceMonitor.getLastFrameTimeMs());
+
+                        Log.d(
+                                TAG,
+                                "Frame sent to MediaPipe | "
+                                        + "timestamp="
+                                        + timestampMs
+                        );
 
                     }
                     finally {
@@ -87,7 +114,7 @@ public class MainActivity extends AppCompatActivity {
                     }
                 });
 
-                    CameraSelector camSelector = CameraSelector.DEFAULT_BACK_CAMERA;
+                    CameraSelector camSelector = CameraSelector.DEFAULT_FRONT_CAMERA;
 
                     try {
                         cameraProvider.unbindAll();
@@ -131,6 +158,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy(){
         super.onDestroy();
         cameraExecutor.shutdown();
+        handlandmark.cleanup();
     }
 
 
