@@ -56,6 +56,9 @@ dependencies {
         // Google AI Edge MediaPipe Vision
         implementation("com.google.mediapipe:tasks-vision:0.10.14")
 
+        //opencv
+        implementation("org.opencv:opencv:4.14.0")
+
         // Guava for Async Futures handling in Java
         implementation("com.google.guava:guava:31.1-android")
 }

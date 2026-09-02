@@ -3,6 +3,7 @@ package com.example.myapplication;
 import android.Manifest;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
+import android.os.Environment;
 import android.util.Log;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -17,11 +18,13 @@ import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+import com.example.myapplication.filter.CartoonFilter;
 import com.example.myapplication.frame.FrameCorners;
 import com.example.myapplication.frame.FrameDetector;
 import com.example.myapplication.vision.HandLandMark;
 import com.google.common.util.concurrent.ListenableFuture;
 
+import java.io.File;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -37,10 +40,12 @@ import android.graphics.Bitmap;
 import android.graphics.Matrix;
 
 import com.example.myapplication.camera.ImageConverter;
+import com.example.myapplication.camera.ImageDumper;
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
 
+import org.opencv.android.OpenCVLoader;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -60,6 +65,13 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        if(!OpenCVLoader.initLocal()){
+            Log.i(TAG,"OpenCV loading failed");
+        }
+        else{
+            Log.i(TAG,"OpenCV loading succeded");
+        }
 
         frameProcessor = new FrameProcessor();
 
@@ -134,7 +146,11 @@ public class MainActivity extends AppCompatActivity {
                         FrameData data = frameProcessor.processFrame(image);
                         performanceMonitor.onFrameEnd(frameStartTime);
 
+                        Log.d(TAG, "ImageProxy = " + image.getWidth() + "x" + image.getHeight());
+
                         Bitmap bitmap = ImageConverter.toBitmap(image);
+
+                        Log.d(TAG, "Bitmap = " + bitmap.getWidth() + "x" + bitmap.getHeight());
 
                         long timestampMs = image.getImageInfo().getTimestamp()/1_000_000L;
 
@@ -149,6 +165,12 @@ public class MainActivity extends AppCompatActivity {
                                 bitmap.getWidth(), bitmap.getHeight(), matrix, true);
 
                         handlandmark.detectAsync(bitmap,timestampMs,0);
+
+                        Bitmap cartoon = CartoonFilter.apply(bitmap);
+                        Log.d(TAG, "Cartoon generated: " + cartoon.getWidth()
+                                        + "x" + cartoon.getHeight());
+
+                        ImageDumper.dump(cartoon, new File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "CartoonDump"));
 
                         performanceMonitor.onFrameEnd(frameStartTime);
                         Log.i(TAG,"width:"+ data.getWidth() + " height:"+ data.getheight()+ " rotationdegree:"+ data.getrotationDegree() + " timestamp:"+ data.getTimeStamp()
