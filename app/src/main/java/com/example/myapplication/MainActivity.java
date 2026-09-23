@@ -5,8 +5,10 @@ import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Environment;
 import android.util.Log;
+import android.view.View;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.ImageView;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
@@ -19,6 +21,7 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import com.example.myapplication.filter.CartoonFilter;
+import com.example.myapplication.filter.RoiCartoonProcessor;
 import com.example.myapplication.frame.FrameCorners;
 import com.example.myapplication.frame.FrameDetector;
 import com.example.myapplication.vision.HandLandMark;
@@ -59,6 +62,12 @@ public class MainActivity extends AppCompatActivity {
     private HandLandMark handlandmark;
     private PerformaneMonitor performanceMonitor;
 
+    private volatile FrameCorners latestframeCorners;
+
+    private volatile Bitmap originalBitmapBeforeRotation;
+
+    private ImageView processedView;
+
     private FrameDetector frameDetector;
     private OverlayView overlayView;
     @Override
@@ -81,25 +90,34 @@ public class MainActivity extends AppCompatActivity {
 
         overlayView = findViewById(R.id.overlayView);
 
+        processedView = findViewById(R.id.processedView);
+
         frameDetector = new FrameDetector();
 
         handlandmark = new HandLandMark(this,
                 new HandLandMark.ResultListener() {
                     @Override
                     public void onResult(HandLandmarkerResult result,int imageWidth,int imageHeight,int rotationDegrees) {
-                        Log.d(
-                                TAG,
-                                "MediaPipe image = "
-                                        + imageWidth
-                                        + "x"
-                                        + imageHeight
-                                        + " | Overlay = "
+                        Log.d(TAG, "MediaPipe image = " + imageWidth + "x" + imageHeight
+                                       + " | Overlay = "
                                         + overlayView.getWidth()
                                         + "x"
                                         + overlayView.getHeight()
                         );
 
                         FrameCorners frameCorners = frameDetector.detect(result);
+                        latestframeCorners = frameCorners;
+                        if(frameCorners!=null) {
+                            Log.i(TAG, "TL = " + frameCorners.getTopleft().x
+                                    + "," + frameCorners.getTopleft().y);
+                            Log.i(TAG, "BL = " + frameCorners.getBottomleft().x
+                                    + "," + frameCorners.getBottomleft().y);
+                            Log.i(TAG, "TR = " + frameCorners.getTopright().x
+                                    + "," + frameCorners.getTopright().y);
+                            Log.i(TAG, "BR = " + frameCorners.getBottomright().x
+                                    + "," + frameCorners.getBottomright().y);
+                        }
+
                         overlayView.setResult(result.landmarks(),imageWidth,imageHeight,rotationDegrees);
                         overlayView.setFrameCorners(frameCorners);
                     }
@@ -150,6 +168,8 @@ public class MainActivity extends AppCompatActivity {
 
                         Bitmap bitmap = ImageConverter.toBitmap(image);
 
+                        originalBitmapBeforeRotation = bitmap.copy(Bitmap.Config.ARGB_8888,true);
+
                         Log.d(TAG, "Bitmap = " + bitmap.getWidth() + "x" + bitmap.getHeight());
 
                         long timestampMs = image.getImageInfo().getTimestamp()/1_000_000L;
@@ -166,12 +186,36 @@ public class MainActivity extends AppCompatActivity {
 
                         handlandmark.detectAsync(bitmap,timestampMs,0);
 
-                        Bitmap cartoon = CartoonFilter.apply(bitmap);
-                        Log.d(TAG, "Cartoon generated: " + cartoon.getWidth()
-                                        + "x" + cartoon.getHeight());
+                        FrameCorners curCorners = latestframeCorners;
+                        int imageW = bitmap.getWidth();
+                        int imageH = bitmap.getHeight();
 
-                        ImageDumper.dump(cartoon, new File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "CartoonDump"));
+                        if(curCorners!=null){
+                            // Quad present: run the cartoon filter + ROI blend.
+                            // Skip both entirely when there is no quad (saves a
+                            // full bilateral/adaptive-threshold pass per frame).
+                            Bitmap cartoon = CartoonFilter.apply(bitmap);
+                            Log.d(TAG, "Cartoon generated: " + cartoon.getWidth()
+                                            + "x" + cartoon.getHeight());
 
+                            // displayFrame is in the correct upright+mirrored
+                            // orientation (same as what PreviewView shows).
+                            final Bitmap finalbitmap = RoiCartoonProcessor.apply(
+                                    bitmap,cartoon,curCorners,imageW,imageH);
+
+                            runOnUiThread(()->{
+                                processedView.setImageBitmap(finalbitmap);
+                                processedView.setVisibility(View.VISIBLE);
+                            });
+                        }
+                        else {
+                            // No quad: hide the processed layer so the plain
+                            // live PreviewView shows through — no cartoon
+                            // anywhere on screen until hands return.
+                            runOnUiThread(()->{
+                                processedView.setVisibility(View.GONE);
+                            });
+                        }
                         performanceMonitor.onFrameEnd(frameStartTime);
                         Log.i(TAG,"width:"+ data.getWidth() + " height:"+ data.getheight()+ " rotationdegree:"+ data.getrotationDegree() + " timestamp:"+ data.getTimeStamp()
                                 +" FPS:" + performanceMonitor.getfps() + " lastframetimems:"+ performanceMonitor.getLastFrameTimeMs());

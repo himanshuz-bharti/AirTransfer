@@ -45,7 +45,7 @@ public class HandLandMark {
         int resultsize =  result.landmarks().size();
         Log.d(TAG,"hand detected" + resultsize);
 
-        if(resultsize==0) return;
+//        if(resultsize==0) return;
         resultlistener.onResult(result, input.getWidth(), input.getHeight(),lastRotationdegrees);
 //        for(int handidx=0;handidx<resultsize;handidx++){
 //            var landmarks = result.landmarks().get(handidx);

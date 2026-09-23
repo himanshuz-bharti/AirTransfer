@@ -113,6 +113,7 @@ public class OverlayView extends View{
     @Override
     protected void onDraw(Canvas canvas){
         super.onDraw(canvas);
+        if(hands==null || (hands.isEmpty() && frameCorners==null)) return;
         if(imageWidth == 0 || imageHeight == 0) return;
 
         // fillCenter (cover) scaling - must match PreviewView scaleType
