@@ -2,6 +2,7 @@ package com.example.myapplication;
 
 import android.Manifest;
 import android.content.pm.PackageManager;
+import android.graphics.BitmapFactory;
 import android.os.Bundle;
 import android.os.Environment;
 import android.util.Log;
@@ -24,10 +25,13 @@ import com.example.myapplication.filter.CartoonFilter;
 import com.example.myapplication.filter.RoiCartoonProcessor;
 import com.example.myapplication.frame.FrameCorners;
 import com.example.myapplication.frame.FrameDetector;
+import com.example.myapplication.frame.FramePoint;
 import com.example.myapplication.vision.HandLandMark;
 import com.google.common.util.concurrent.ListenableFuture;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -47,8 +51,10 @@ import com.example.myapplication.camera.ImageDumper;
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
+import com.example.myapplication.filter.AnimeGanProcessor;
 
 import org.opencv.android.OpenCVLoader;
+import android.graphics.Rect;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -70,6 +76,16 @@ public class MainActivity extends AppCompatActivity {
 
     private FrameDetector frameDetector;
     private OverlayView overlayView;
+
+    private AnimeGanProcessor animeGanProcessor;
+
+    private ExecutorService ganExecutor;
+    private volatile Bitmap animeFullFrame;
+    private volatile Rect lastGanRoi;
+    private long lastGanMs;
+    private volatile boolean ganBusy = false;
+    private volatile long ganGeneration;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -85,6 +101,36 @@ public class MainActivity extends AppCompatActivity {
         frameProcessor = new FrameProcessor();
 
         performanceMonitor = new PerformaneMonitor();
+
+        try{
+            animeGanProcessor = new AnimeGanProcessor(this);
+//            InputStream inputStream = getAssets().open("20260919_151325.jpg");
+//            Bitmap testBitmap = BitmapFactory.decodeStream(inputStream);
+//            inputStream.close();
+//
+//            long startTime = System.currentTimeMillis();
+//
+//            Bitmap result = animeGanProcessor.process(testBitmap);
+//
+//            long elapsed = System.currentTimeMillis() - startTime;
+//
+//            Log.d(TAG, "Inference completed in " + elapsed + " ms");
+//
+//            //save bitmap
+//
+//            File outputFile = new File(getExternalFilesDir(null),"anime_res.png");
+//            FileOutputStream outputStream = new FileOutputStream(outputFile);
+//
+//            result.compress(Bitmap.CompressFormat.PNG,100,outputStream);
+//
+//            outputStream.flush();
+//            outputStream.close();
+//
+//            Log.d(TAG, "Result saved to: " + outputFile.getAbsolutePath());
+//
+        }catch(Exception e){
+            Log.e(TAG,"AnimeGan faield to load");
+        }
 
         viewFinder = findViewById(R.id.viewFinder);
 
@@ -133,6 +179,7 @@ public class MainActivity extends AppCompatActivity {
                 });
 
         cameraExecutor = Executors.newSingleThreadExecutor();
+        ganExecutor = Executors.newSingleThreadExecutor();
         if(allRequiredPermissions()){
             startCamera();
         }
@@ -166,11 +213,11 @@ public class MainActivity extends AppCompatActivity {
 
                         Log.d(TAG, "ImageProxy = " + image.getWidth() + "x" + image.getHeight());
 
-                        Bitmap bitmap = ImageConverter.toBitmap(image);
+                        Bitmap imgbitmap = ImageConverter.toBitmap(image);
 
-                        originalBitmapBeforeRotation = bitmap.copy(Bitmap.Config.ARGB_8888,true);
+                        originalBitmapBeforeRotation = imgbitmap.copy(Bitmap.Config.ARGB_8888,true);
 
-                        Log.d(TAG, "Bitmap = " + bitmap.getWidth() + "x" + bitmap.getHeight());
+                        Log.d(TAG, "Bitmap = " + imgbitmap.getWidth() + "x" + imgbitmap.getHeight());
 
                         long timestampMs = image.getImageInfo().getTimestamp()/1_000_000L;
 
@@ -181,27 +228,58 @@ public class MainActivity extends AppCompatActivity {
                         Matrix matrix = new Matrix();
                         matrix.postRotate(rotationDegrees);
                         matrix.postScale(-1f, 1f);
-                        bitmap = Bitmap.createBitmap(bitmap, 0, 0,
-                                bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+                        imgbitmap = Bitmap.createBitmap(imgbitmap, 0, 0,
+                                imgbitmap.getWidth(), imgbitmap.getHeight(), matrix, true);
 
-                        handlandmark.detectAsync(bitmap,timestampMs,0);
+                        handlandmark.detectAsync(imgbitmap,timestampMs,0);
 
                         FrameCorners curCorners = latestframeCorners;
-                        int imageW = bitmap.getWidth();
-                        int imageH = bitmap.getHeight();
+                        int imageW = imgbitmap.getWidth();
+                        int imageH = imgbitmap.getHeight();
 
                         if(curCorners!=null){
                             // Quad present: run the cartoon filter + ROI blend.
                             // Skip both entirely when there is no quad (saves a
                             // full bilateral/adaptive-threshold pass per frame).
-                            Bitmap cartoon = CartoonFilter.apply(bitmap);
-                            Log.d(TAG, "Cartoon generated: " + cartoon.getWidth()
-                                            + "x" + cartoon.getHeight());
 
+//                            Bitmap cartoon = CartoonFilter.apply(bitmap);
+//                            Log.d(TAG, "Cartoon generated: " + cartoon.getWidth()
+//                                            + "x" + cartoon.getHeight());
+
+                            Rect box = computeQuad(curCorners,imageW,imageH);
+//                            Bitmap stylized = (box!=null)?animeGanProcessor.stylize(bitmap,box):CartoonFilter.apply(bitmap);
+
+                            if(box!=null){
+                                long now = System.currentTimeMillis();
+                                boolean movedFar = lastGanRoi == null || (Math.abs(box.centerX()-lastGanRoi.centerX())>40)
+                                        || (Math.abs(box.centerY()-lastGanRoi.centerY())>40);
+                                boolean stale = now - lastGanMs > 500;
+                                if(!ganBusy && (movedFar || stale)){
+                                    animeFullFrame = null;
+                                    lastGanRoi = box;
+                                    lastGanMs = now;
+                                    ganBusy = true;
+                                    ganGeneration++;
+                                    final long gen = ganGeneration;
+                                    final Bitmap frameforanime = imgbitmap;
+                                    final Rect r = box;
+                                    ganExecutor.execute(()->{
+                                        try{
+                                            Bitmap anime = animeGanProcessor.stylize(frameforanime,r);
+                                            if(gen == ganGeneration) animeFullFrame = anime;
+                                        } catch (Exception e) {
+                                            throw new RuntimeException(e);
+                                        } finally {
+                                            ganBusy = false;
+                                        }
+                                    });
+                                }
+                            }
                             // displayFrame is in the correct upright+mirrored
                             // orientation (same as what PreviewView shows).
+                            Bitmap stylized = (animeFullFrame!=null)?animeFullFrame:CartoonFilter.apply(imgbitmap);
                             final Bitmap finalbitmap = RoiCartoonProcessor.apply(
-                                    bitmap,cartoon,curCorners,imageW,imageH);
+                                    imgbitmap,stylized,curCorners,imageW,imageH);
 
                             runOnUiThread(()->{
                                 processedView.setImageBitmap(finalbitmap);
@@ -248,6 +326,20 @@ public class MainActivity extends AppCompatActivity {
         },ContextCompat.getMainExecutor(this));
     }
 
+    private Rect computeQuad(FrameCorners fc,int w,int h){
+        float minX=1,minY=1,maxX=0,maxY=0;
+        FramePoint[] pts={fc.getTopleft(),fc.getTopright(),fc.getBottomleft(),fc.getBottomright()};
+        for(FramePoint p:pts){
+            if(p==null) return null;
+            minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+            minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+        }
+        int mx = (int) ((maxX - minX) * w * 0.10f) + 8;   // 10% margin + 8px padding
+        int my = (int) ((maxY - minY) * h * 0.10f) + 8;
+        return new Rect((int) (minX * w) - mx, (int) (minY * h) - my,
+                (int) (maxX * w) + mx, (int) (maxY * h) + my);
+    }
+
     private boolean allRequiredPermissions(){
         for(String permission:REQUIRED_PERMISSIONS){
             if(ContextCompat.checkSelfPermission(this,permission)
@@ -277,6 +369,8 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy(){
         super.onDestroy();
         cameraExecutor.shutdown();
+        ganExecutor.shutdown();
+        animeGanProcessor.close();
         handlandmark.cleanup();
     }
 

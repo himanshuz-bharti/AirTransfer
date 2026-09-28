@@ -41,6 +41,16 @@ public class FrameDetector {
             }
         }
 
+        // All four corners are required for a valid quad. If MediaPipe labels
+        // both hands the same way (common with the mirrored front camera), one
+        // pair of points stays null — returning them would NPE downstream (and
+        // inside MediaPipe's JNI callback that turns the NPE into a SIGABRT).
+        if(topleft==null || bottomleft==null || topright==null || bottomright==null){
+            Log.d(TAG, "Incomplete quad: TL=" + topleft + " BL=" + bottomleft
+                    + " TR=" + topright + " BR=" + bottomright + " — ignoring");
+            return null;
+        }
+
         FrameCorners corner = new FrameCorners(topleft,bottomleft,topright,bottomright);
         return corner;
     }

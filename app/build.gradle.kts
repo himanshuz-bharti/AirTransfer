@@ -53,8 +53,7 @@ dependencies {
         implementation("androidx.camera:camera-view:$cameraxVersion")
         implementation("com.google.mediapipe:tasks-vision:0.10.29")
 
-        // Google AI Edge MediaPipe Vision
-        implementation("com.google.mediapipe:tasks-vision:0.10.14")
+        implementation("com.google.ai.edge.litert:litert:1.4.0")
 
         //opencv
         implementation("org.opencv:opencv:4.14.0")
