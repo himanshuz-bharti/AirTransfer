@@ -1,10 +1,16 @@
 package com.example.myapplication;
 
 import android.Manifest;
+import android.app.Activity;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.pm.PackageManager;
 import android.graphics.BitmapFactory;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.provider.MediaStore;
 import android.util.Log;
 import android.view.View;
 import android.widget.TextView;
@@ -21,6 +27,7 @@ import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
+import com.example.myapplication.camera.VideoRecorder;
 import com.example.myapplication.filter.CartoonFilter;
 import com.example.myapplication.filter.RoiCartoonProcessor;
 import com.example.myapplication.frame.FrameCorners;
@@ -31,7 +38,9 @@ import com.google.common.util.concurrent.ListenableFuture;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -60,6 +69,7 @@ public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "CameraX";
     private static final int REQUEST_PERMISSION_CODE = 10;
+    private static final int REQUEST_STORAGE_CODE = 11;
     private static final String[] REQUIRED_PERMISSIONS = new String[]{Manifest.permission.CAMERA};
 
     private FrameProcessor frameProcessor;
@@ -85,6 +95,12 @@ public class MainActivity extends AppCompatActivity {
     private long lastGanMs;
     private volatile boolean ganBusy = false;
     private volatile long ganGeneration;
+    private volatile Bitmap latestframe;
+    private ExecutorService captureExecutor;
+    private VideoRecorder videoRecorder;
+    private volatile Boolean isRecording = false;
+    private ExecutorService videoExecutor;
+    private File pendingVideoFile;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -180,6 +196,12 @@ public class MainActivity extends AppCompatActivity {
 
         cameraExecutor = Executors.newSingleThreadExecutor();
         ganExecutor = Executors.newSingleThreadExecutor();
+        captureExecutor = Executors.newSingleThreadExecutor();
+        videoExecutor = Executors.newSingleThreadExecutor();
+        videoRecorder = new VideoRecorder();
+
+        findViewById(R.id.btnCapture).setOnClickListener(v->capturePhoto());
+        //findViewById(R.id.btnRecord).setOnClickListener(v->toggleRecord());
         if(allRequiredPermissions()){
             startCamera();
         }
@@ -190,7 +212,45 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void capturePhoto(){
+        final Bitmap capturedFrame = latestframe;
+        if (capturedFrame == null) {
+            Toast.makeText(this,"No image for capture",Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        captureExecutor.execute(()->{
+            long currentTimeMs = System.currentTimeMillis();
+            String filename = "anime_" + currentTimeMs + ".png";
+            ContentValues v = new ContentValues();
+            v.put(MediaStore.Images.Media.DISPLAY_NAME,filename);
+            v.put(MediaStore.Images.Media.MIME_TYPE,"image/jpeg");
+            v.put(MediaStore.Images.Media.RELATIVE_PATH,Environment.DIRECTORY_PICTURES + "/AnimeFilter");
+            v.put(MediaStore.Images.Media.IS_PENDING,1);
+
+            ContentResolver contentResolver = getContentResolver();
+            Uri uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,v);
+            if(uri==null) return;
+            try(OutputStream os = contentResolver.openOutputStream(uri)){
+                capturedFrame.compress(Bitmap.CompressFormat.JPEG,95,os);
+            } catch(IOException e){
+                Log.e(TAG,"Photo saved failed"+e);
+                return;
+            }
+            v.clear();
+            v.put(MediaStore.Images.Media.IS_PENDING,0);
+            contentResolver.update(uri,v,null,null);
+            runOnUiThread(()->{
+                Toast.makeText(this,"Saved to Pictures/AnieFilter"+filename, Toast.LENGTH_LONG).show();
+            });
+
+        });
+    }
+
     private void startCamera(){
+
+        requestStorageIfNeeded();
+
         ListenableFuture<ProcessCameraProvider> cameraProviderFuture = ProcessCameraProvider.getInstance(this);
 
         cameraProviderFuture.addListener(()->{
@@ -281,6 +341,8 @@ public class MainActivity extends AppCompatActivity {
                             final Bitmap finalbitmap = RoiCartoonProcessor.apply(
                                     imgbitmap,stylized,curCorners,imageW,imageH);
 
+                            latestframe = finalbitmap;
+
                             runOnUiThread(()->{
                                 processedView.setImageBitmap(finalbitmap);
                                 processedView.setVisibility(View.VISIBLE);
@@ -290,6 +352,7 @@ public class MainActivity extends AppCompatActivity {
                             // No quad: hide the processed layer so the plain
                             // live PreviewView shows through — no cartoon
                             // anywhere on screen until hands return.
+                            latestframe = imgbitmap;
                             runOnUiThread(()->{
                                 processedView.setVisibility(View.GONE);
                             });
@@ -340,6 +403,16 @@ public class MainActivity extends AppCompatActivity {
                 (int) (maxX * w) + mx, (int) (maxY * h) + my);
     }
 
+    private void requestStorageIfNeeded(){
+        if(Build.VERSION.SDK_INT<Build.VERSION_CODES.Q
+                && ContextCompat.checkSelfPermission(this,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE)!=PackageManager.PERMISSION_GRANTED){
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},REQUEST_STORAGE_CODE);
+
+        }
+    }
+
     private boolean allRequiredPermissions(){
         for(String permission:REQUIRED_PERMISSIONS){
             if(ContextCompat.checkSelfPermission(this,permission)
@@ -363,6 +436,13 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
+        if(requestCode == REQUEST_STORAGE_CODE){
+            if(ContextCompat.checkSelfPermission(this,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE)!=PackageManager.PERMISSION_GRANTED){
+                Toast.makeText(this,"Storage permission is denied, image wont save",Toast.LENGTH_LONG).show();;
+            }
+        }
+
     }
 
     @Override
@@ -370,6 +450,8 @@ public class MainActivity extends AppCompatActivity {
         super.onDestroy();
         cameraExecutor.shutdown();
         ganExecutor.shutdown();
+        captureExecutor.shutdown();
+
         animeGanProcessor.close();
         handlandmark.cleanup();
     }
