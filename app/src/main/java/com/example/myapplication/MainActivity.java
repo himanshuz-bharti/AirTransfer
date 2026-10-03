@@ -14,10 +14,14 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.widget.ImageView;
@@ -48,6 +52,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -108,6 +113,48 @@ public class MainActivity extends AppCompatActivity {
     private ExecutorService videoExecutor;
     private File pendingVideoFile;
 
+    private TextView recTimer;
+    private View recDot;
+    private LinearLayout recIndicator;
+    private long recordingStartedAtMs;
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+
+
+    /** Arms the encoder. Must complete before the first queueFrame() call. */
+
+    private final Runnable recTick = new Runnable() {
+        @Override
+        public void run() {
+            if(recordingStartedAtMs == 0) return;
+            updateRecTimer();
+            uiHandler.postDelayed(this,200);
+        }
+    };
+
+    private void startRecIndicator(){
+        recordingStartedAtMs = SystemClock.elapsedRealtime();
+        recIndicator.setVisibility(View.VISIBLE);
+        recDot.setAlpha(1f);
+        updateRecTimer();
+        uiHandler.removeCallbacks(recTick);
+        uiHandler.post(recTick);
+    }
+
+    private void stopRecIndicator(){
+        recordingStartedAtMs = 0;
+        uiHandler.removeCallbacks(recTick);
+        recIndicator.setVisibility(View.GONE);
+    }
+
+    private void updateRecTimer(){
+        long elapsed = (SystemClock.elapsedRealtime()-recordingStartedAtMs)/1000;
+        long mm = elapsed/60;
+        long ss = elapsed%60;
+        recTimer.setText(String.format(Locale.US,"REC %02d:%02d",mm,ss));
+
+        recDot.setAlpha(elapsed%2==0?1f:0.25f);
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -161,6 +208,10 @@ public class MainActivity extends AppCompatActivity {
         processedView = findViewById(R.id.processedView);
 
         frameDetector = new FrameDetector();
+
+        recIndicator = findViewById(R.id.recIndicator);
+        recTimer = findViewById(R.id.recTimer);
+        recDot = findViewById(R.id.recDot);
 
         handlandmark = new HandLandMark(this,
                 new HandLandMark.ResultListener() {
@@ -281,6 +332,7 @@ public class MainActivity extends AppCompatActivity {
             });
 
             runOnUiThread(()->((Button)findViewById(R.id.btnRecord)).setText("● REC"));
+            stopRecIndicator();
         }
         else{
             final Bitmap first = latestframe;
@@ -295,14 +347,17 @@ public class MainActivity extends AppCompatActivity {
             videoExecutor.execute(()->{
                 try{
                     videoRecorder.start(file,first.getWidth(),first.getHeight());
-                    runOnUiThread(()->isRecording=true);
+                    runOnUiThread(()->{
+                        isRecording=true;
+                        ((Button)findViewById(R.id.btnRecord)).setText("■ STOP");
+                        startRecIndicator();
+                    });
                 } catch(Exception e){
                     Log.e(TAG,"failed to start recording"+e);
                     runOnUiThread(()-> Toast.makeText(this,"Could not start recording",Toast.LENGTH_SHORT).show());
                 }
 
             });
-            runOnUiThread(()->((Button)findViewById(R.id.btnRecord)).setText("■ STOP"));
         }
     }
 
@@ -582,6 +637,7 @@ public class MainActivity extends AppCompatActivity {
             }
         });
         runOnUiThread(()->((Button)findViewById(R.id.btnRecord)).setText("● REC"));
+        stopRecIndicator();
     }
 
     private void publishVideoToGallery(File file){
