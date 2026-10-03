@@ -6,6 +6,10 @@ import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.pm.PackageManager;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -13,6 +17,7 @@ import android.os.Environment;
 import android.provider.MediaStore;
 import android.util.Log;
 import android.view.View;
+import android.widget.Button;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.widget.ImageView;
@@ -37,6 +42,7 @@ import com.example.myapplication.vision.HandLandMark;
 import com.google.common.util.concurrent.ListenableFuture;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -98,7 +104,7 @@ public class MainActivity extends AppCompatActivity {
     private volatile Bitmap latestframe;
     private ExecutorService captureExecutor;
     private VideoRecorder videoRecorder;
-    private volatile Boolean isRecording = false;
+    private volatile boolean isRecording = false;
     private ExecutorService videoExecutor;
     private File pendingVideoFile;
 
@@ -201,7 +207,7 @@ public class MainActivity extends AppCompatActivity {
         videoRecorder = new VideoRecorder();
 
         findViewById(R.id.btnCapture).setOnClickListener(v->capturePhoto());
-        //findViewById(R.id.btnRecord).setOnClickListener(v->toggleRecord());
+        findViewById(R.id.btnRecord).setOnClickListener(v->toggleRecord());
         if(allRequiredPermissions()){
             startCamera();
         }
@@ -219,7 +225,16 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        final FrameCorners corners = latestframeCorners;
+
         captureExecutor.execute(()->{
+
+            Bitmap out = capturedFrame.copy(Bitmap.Config.ARGB_8888,true);
+            if(out==null) return;
+
+            if(corners!=null){
+                drawQuad(corners,out);
+            }
             long currentTimeMs = System.currentTimeMillis();
             String filename = "anime_" + currentTimeMs + ".png";
             ContentValues v = new ContentValues();
@@ -232,7 +247,7 @@ public class MainActivity extends AppCompatActivity {
             Uri uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,v);
             if(uri==null) return;
             try(OutputStream os = contentResolver.openOutputStream(uri)){
-                capturedFrame.compress(Bitmap.CompressFormat.JPEG,95,os);
+                out.compress(Bitmap.CompressFormat.JPEG,95,os);
             } catch(IOException e){
                 Log.e(TAG,"Photo saved failed"+e);
                 return;
@@ -245,6 +260,89 @@ public class MainActivity extends AppCompatActivity {
             });
 
         });
+    }
+
+    private void toggleRecord(){
+        if(isRecording){
+            isRecording = false;
+            videoExecutor.execute(()->{
+                File file = videoRecorder.stop();
+                if(file!=null && file.exists() && file.length()>0){
+                    // TODO: publish the finished mp4 to MediaStore Movies/AnimeFilter here.
+                     publishVideoToGallery(file);
+                    Log.i(TAG, "Recording saved to " + file.getAbsolutePath()
+                            + " (" + file.length() / 1024 + " KB)");
+                    runOnUiThread(()-> Toast.makeText(this,
+                            "Video saved: " + file.getName(), Toast.LENGTH_LONG).show());
+                }
+                else{
+                    runOnUiThread(()-> Toast.makeText(this,"Recording Failed",Toast.LENGTH_SHORT).show());
+                }
+            });
+
+            runOnUiThread(()->((Button)findViewById(R.id.btnRecord)).setText("● REC"));
+        }
+        else{
+            final Bitmap first = latestframe;
+            if(first==null){
+                Toast.makeText(this,"No camera Frames yet",Toast.LENGTH_SHORT).show();
+                return;
+            }
+            File dir = new File(getCacheDir(),"video");
+            dir.mkdirs();
+            pendingVideoFile = new File(dir,"anime_"+System.currentTimeMillis()+".mp4");
+            File file = pendingVideoFile;
+            videoExecutor.execute(()->{
+                try{
+                    videoRecorder.start(file,first.getWidth(),first.getHeight());
+                    runOnUiThread(()->isRecording=true);
+                } catch(Exception e){
+                    Log.e(TAG,"failed to start recording"+e);
+                    runOnUiThread(()-> Toast.makeText(this,"Could not start recording",Toast.LENGTH_SHORT).show());
+                }
+
+            });
+            runOnUiThread(()->((Button)findViewById(R.id.btnRecord)).setText("■ STOP"));
+        }
+    }
+
+
+    private void drawQuad(FrameCorners fc,Bitmap bmp){
+        FramePoint tl = fc.getTopleft();
+        FramePoint tr = fc.getTopright();
+        FramePoint bl = fc.getBottomleft();
+        FramePoint br = fc.getBottomright();
+
+        if(tl==null || tr==null || bl==null || br==null) return;
+        Path quad = new Path();
+        float w = bmp.getWidth() , h = bmp.getHeight();
+
+        quad.moveTo(tl.x*w,tl.y*h);
+        quad.lineTo(tr.x*w,tr.y*h);
+        quad.lineTo(br.x*w,br.y*h);
+        quad.lineTo(bl.x*w,bl.y*h);
+        quad.close();
+
+        Canvas canvas = new Canvas(bmp);
+
+        float stroke = Math.max(6f,bmp.getWidth()/60f);
+
+        Paint halo = new Paint(Paint.ANTI_ALIAS_FLAG);
+        halo.setStyle(Paint.Style.STROKE);
+        halo.setStrokeWidth(stroke * 2.2f);
+        halo.setColor(Color.argb(160, 0, 0, 0));
+        halo.setStrokeCap(Paint.Cap.ROUND);
+        halo.setStrokeJoin(Paint.Join.ROUND);
+        canvas.drawPath(quad, halo);
+
+        Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);       // cyan top stroke (matches OverlayView)
+        line.setStyle(Paint.Style.STROKE);
+        line.setStrokeWidth(stroke);
+        line.setColor(Color.CYAN);
+        line.setStrokeCap(Paint.Cap.ROUND);
+        line.setStrokeJoin(Paint.Join.ROUND);
+        canvas.drawPath(quad, line);
+
     }
 
     private void startCamera(){
@@ -297,6 +395,14 @@ public class MainActivity extends AppCompatActivity {
                         int imageW = imgbitmap.getWidth();
                         int imageH = imgbitmap.getHeight();
 
+                        // Snapshot corners for the recorder so the outline baked into
+                        // the video matches the pixels of this exact frame.
+                        final FrameCorners cornersForRecording = latestframeCorners;
+
+                        // Set by whichever branch runs below; feeds the recorder and
+                        // mirrors exactly what processedView displays.
+                        Bitmap displayFrame;
+
                         if(curCorners!=null){
                             // Quad present: run the cartoon filter + ROI blend.
                             // Skip both entirely when there is no quad (saves a
@@ -342,6 +448,7 @@ public class MainActivity extends AppCompatActivity {
                                     imgbitmap,stylized,curCorners,imageW,imageH);
 
                             latestframe = finalbitmap;
+                            displayFrame = finalbitmap;
 
                             runOnUiThread(()->{
                                 processedView.setImageBitmap(finalbitmap);
@@ -353,9 +460,21 @@ public class MainActivity extends AppCompatActivity {
                             // live PreviewView shows through — no cartoon
                             // anywhere on screen until hands return.
                             latestframe = imgbitmap;
+                            displayFrame = imgbitmap;
                             runOnUiThread(()->{
                                 processedView.setVisibility(View.GONE);
                             });
+                        }
+
+                        if (isRecording) {
+                            // Copy: the display bitmap is shared with the UI thread, so
+                            // drawing the outline on it would also paint the live preview.
+                            Bitmap recordCopy = displayFrame.copy(Bitmap.Config.ARGB_8888, true);
+                            if (cornersForRecording != null) {
+                                drawQuad(cornersForRecording, recordCopy);
+                            }
+                            final Bitmap frameToRecord = recordCopy;
+                            videoExecutor.execute(() -> videoRecorder.queueFrame(frameToRecord));
                         }
                         performanceMonitor.onFrameEnd(frameStartTime);
                         Log.i(TAG,"width:"+ data.getWidth() + " height:"+ data.getheight()+ " rotationdegree:"+ data.getrotationDegree() + " timestamp:"+ data.getTimeStamp()
@@ -446,11 +565,60 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onStop(){
+        super.onStop();
+        // A recording left open never gets its MP4 trailer written -> unplayable file.
+        finishRecordingIfActive();
+    }
+
+    private void finishRecordingIfActive(){
+        if(!isRecording) return;
+        isRecording = false;
+        videoExecutor.execute(()->{
+            File file = videoRecorder.stop();
+            if(file!=null && file.exists() && file.length()>0){
+                publishVideoToGallery(file);
+                Log.i(TAG,"Recording finalised on stop: "+file.getAbsolutePath());
+            }
+        });
+        runOnUiThread(()->((Button)findViewById(R.id.btnRecord)).setText("● REC"));
+    }
+
+    private void publishVideoToGallery(File file){
+        ContentValues v = new ContentValues();
+        v.put(MediaStore.Video.Media.DISPLAY_NAME,file.getName());
+        v.put(MediaStore.Video.Media.MIME_TYPE,"video/mp4");
+        v.put(MediaStore.Video.Media.RELATIVE_PATH,Environment.DIRECTORY_MOVIES+"/AnimeFIlter");
+        v.put(MediaStore.Video.Media.IS_PENDING,1);
+
+        ContentResolver cr = getContentResolver();
+        Uri uri = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI,v);
+        if(uri == null){
+            file.delete();
+            return;
+        }
+        try(OutputStream os = cr.openOutputStream(uri); InputStream in = new FileInputStream(file)){
+            byte[] buf = new byte[8192];
+            int n;
+            while((n=in.read(buf))>0) os.write(buf,0,n);
+        }catch (IOException e) {
+            Log.e(TAG, "video publish failed", e);
+        }
+        v.clear();
+        v.put(MediaStore.Video.Media.IS_PENDING,0);
+        cr.update(uri,v,null,null);
+        file.delete();
+        runOnUiThread(() -> Toast.makeText(this,
+                "Saved to Movies/AnimeFilter", Toast.LENGTH_SHORT).show());
+    }
+    @Override
     protected void onDestroy(){
         super.onDestroy();
+        finishRecordingIfActive();
         cameraExecutor.shutdown();
         ganExecutor.shutdown();
         captureExecutor.shutdown();
+        videoExecutor.shutdown();
 
         animeGanProcessor.close();
         handlandmark.cleanup();
