@@ -12,7 +12,7 @@ public class FrameDetector {
 
     public static String TAG = "FrameDetector";
 
-    public FrameCorners detect(HandLandmarkerResult result) {
+    public static FrameCorners detect(HandLandmarkerResult result) {
         if(result==null || result.landmarks().size()<2) return null;
         List<List<NormalizedLandmark>> hands = result.landmarks();
         List<List<Category>> handedness = result.handedness();
