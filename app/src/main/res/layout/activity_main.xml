@@ -2,99 +2,36 @@
 <androidx.constraintlayout.widget.ConstraintLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
-    xmlns:tools="http://schemas.android.com/tools"
-    android:id="@+id/main"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    tools:context=".MainActivity">
+    android:background="#00000000">
 
+    <!-- Camera preview fills the screen -->
     <androidx.camera.view.PreviewView
         android:id="@+id/viewFinder"
-        android:layout_width="0dp"
-        android:layout_height="0dp"
-        app:scaleType="fillCenter"
-        app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="visible"
+        app:scaleType="fillCenter" />
 
-    <!-- Processed frame -->
-    <ImageView
-        android:id="@+id/processedView"
-        android:layout_width="0dp"
-        android:layout_height="0dp"
-        android:scaleType="centerCrop"
-        android:visibility="gone"
-        app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
-
+    <!-- Hand-gesture overlay: drawn on top of the camera preview -->
     <com.example.myapplication.ui.OverlayView
         android:id="@+id/overlayView"
-        android:layout_width="0dp"
-        android:layout_height="0dp"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
         android:clickable="false"
-        android:focusable="false"
+        android:focusable="false" />
+
+    <ImageButton
+        android:id="@+id/btnSwitch"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:background="@drawable/bg_circle_button"
+        android:src="@drawable/ic_switch_camera"
+        android:scaleType="centerInside"
+        android:layout_marginTop="24dp"
+        android:layout_marginEnd="24dp"
         app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
-
-    <Button
-        android:id="@+id/btnCapture"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="PHOTO"
-        android:textColor="@android:color/white"
-        android:backgroundTint="#CC000000"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toStartOf="@id/btnRecord"
-        app:layout_constraintTop_toTopOf="@id/btnRecord"
-        android:layout_marginEnd="24dp" />
-
-    <Button
-        android:id="@+id/btnRecord"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="● REC"
-        android:textColor="@android:color/white"
-        android:backgroundTint="#CC000000"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
-        android:layout_marginBottom="48dp" />
-
-    <!-- Recording indicator: red dot + label -->
-    <LinearLayout
-        android:id="@+id/recIndicator"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:background="#99000000"
-        android:padding="8dp"
-        android:visibility="gone"
-        app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        android:layout_margin="24dp">
-
-        <View
-            android:id="@+id/recDot"
-            android:layout_width="12dp"
-            android:layout_height="12dp"
-            android:background="@android:color/holo_red_dark"
-            android:layout_marginEnd="8dp" />
-
-        <TextView
-            android:id="@+id/recTimer"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="REC  00:00"
-            android:textColor="@android:color/white"
-            android:textSize="18sp"
-            android:fontFamily="monospace"
-            android:textStyle="bold" />
-    </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>

@@ -33,6 +33,15 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
+    // TFLite models must remain UNCOMPRESSED in the APK, otherwise
+    // AssetManager.openFd() (used for memory-mapped loading) fails with
+    // "This file can not be opened as a file descriptor; it is probably compressed."
+    androidResources {
+        noCompress += "tflite"
+        noCompress += "onnx"
+        noCompress += "task"
+    }
 }
 
 dependencies {
@@ -54,8 +63,11 @@ dependencies {
         implementation("com.google.mediapipe:tasks-vision:0.10.29")
 
         implementation("com.google.ai.edge.litert:litert:1.4.0")
+        implementation("com.google.android.material:material:1.11.0")
+        implementation("org.tensorflow:tensorflow-lite-gpu:2.14.0")
 
-        //opencv
+
+    //opencv
         implementation("org.opencv:opencv:4.14.0")
 
         // Guava for Async Futures handling in Java
