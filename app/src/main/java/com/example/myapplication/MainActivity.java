@@ -27,6 +27,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 import android.widget.ImageView;
 
+import androidx.activity.result.contract.ActivityResultContract;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.camera.core.CameraSelector;
@@ -36,7 +37,12 @@ import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+import android.content.ContentResolver;
+import android.net.Uri;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 
+import com.example.myapplication.Transfer.TransferWebSocketClient;
 import com.example.myapplication.camera.FrameData;
 import com.example.myapplication.camera.FrameProcessor;
 import com.example.myapplication.camera.ImageConverter;
@@ -51,6 +57,7 @@ import com.google.common.util.concurrent.ListenableFuture;
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
+import com.example.myapplication.Transfer.TransferFileSender;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -58,6 +65,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.URI;
 import java.util.Locale;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -93,6 +101,9 @@ public class MainActivity extends AppCompatActivity {
     private ImageButton btnRecordBtn;
     private long recordingStartedAtMs;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
+
+    private TransferWebSocketClient webSocketClient;
+    private TransferFileSender fileSender;
 
     private final Runnable recTick = new Runnable() {
         @Override
@@ -133,6 +144,63 @@ public class MainActivity extends AppCompatActivity {
         recDot.setAlpha(elapsed % 2 == 0 ? 1f : 0.25f);
     }
 
+    private final ActivityResultLauncher<String> filePicker = registerForActivityResult(
+            new ActivityResultContracts.GetContent(),
+            uri -> {
+                if (uri != null) {
+                    if (fileSender != null) {
+                        fileSender.sendFile(getContentResolver(), uri);
+                    } else {
+                        Toast.makeText(this, "WebSocket not initialized", Toast.LENGTH_SHORT).show();
+                    }
+                }
+            });
+
+    private void openFilePicker() {
+        filePicker.launch("*/*");
+    }
+
+    private final ExecutorService wsExecutor = Executors.newSingleThreadExecutor();
+
+    private void testWebSocket() {
+        try {
+            URI uri = new URI("ws://192.168.1.4:8080");
+            webSocketClient = new TransferWebSocketClient(uri, new TransferWebSocketClient.Listener() {
+                @Override
+                public void onConnected() {
+                    Log.i(TAG, "WebSocket connected");
+                }
+
+                @Override
+                public void onDisconnected() {
+                    Log.i(TAG, "WebSocket disconnected");
+                }
+
+                @Override
+                public void onTextMessage(String message) {
+                    if (fileSender != null) {
+                        fileSender.onTextMessage(message);
+                    }
+                    Log.d(TAG, "WS message: " + message);
+                }
+
+                @Override
+                public void onError(Exception e) {
+                    Log.e(TAG, "WebSocket error", e);
+                }
+            });
+            wsExecutor.execute(() -> {
+                try {
+                    webSocketClient.connect();
+                } catch (Exception e) {
+                    Log.e(TAG, "Connect failed", e);
+                }
+            });
+        } catch (Exception e) {
+            Log.e(TAG, "testWebSocket error", e);
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -147,6 +215,30 @@ public class MainActivity extends AppCompatActivity {
         recIndicator = findViewById(R.id.recIndicator);
         recTimer = findViewById(R.id.recTimer);
         recDot = findViewById(R.id.recDot);
+
+        // Initialize file sender safely
+        // Note: webSocketClient is created elsewhere in your code if you have it.
+        // If it's not initialized yet, fileSender will be null; the button will guard against it.
+        Log.i(TAG,"Before websockets initialization");
+        testWebSocket();
+        Log.i(TAG,"After websockets initialization");
+        if (webSocketClient != null) {
+            fileSender = new TransferFileSender(webSocketClient);
+        } else {
+            fileSender = null;
+        }
+
+        // Set up send file button (guarded if connection not ready)
+        ImageButton btnSendFile = findViewById(R.id.btnSendFile);
+        if (btnSendFile != null) {
+            btnSendFile.setOnClickListener(v -> {
+                if (webSocketClient != null && webSocketClient.isOpen() && fileSender != null) {
+                    openFilePicker();
+                } else {
+                    Toast.makeText(this, "WebSocket not connected", Toast.LENGTH_SHORT).show();
+                }
+            });
+        }
 
         handlandmark = new HandLandMark(this,
                 new HandLandMark.ResultListener() {

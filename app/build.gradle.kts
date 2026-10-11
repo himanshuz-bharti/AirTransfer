@@ -5,14 +5,12 @@ plugins {
 android {
     namespace = "com.example.myapplication"
     compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
+        version = release(37)
     }
 
     defaultConfig {
         applicationId = "com.example.myapplication"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
@@ -55,6 +53,9 @@ dependencies {
 
         implementation("com.google.ai.edge.litert:litert:1.4.0")
         implementation("com.google.android.material:material:1.11.0")
+
+        implementation("org.java-websocket:Java-WebSocket:1.6.0")
+        implementation("com.squareup.okhttp3:okhttp:5.5.0")
 
 
     //opencv

@@ -92,4 +92,17 @@
             android:layout_gravity="center_vertical" />
     </LinearLayout>
 
+    <ImageButton
+        android:id="@+id/btnSendFile"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:background="@drawable/bg_circle_button"
+        android:src="@android:drawable/ic_menu_share"
+        android:scaleType="centerInside"
+        android:layout_marginBottom="120dp"
+        android:layout_marginEnd="24dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+
 </androidx.constraintlayout.widget.ConstraintLayout>
