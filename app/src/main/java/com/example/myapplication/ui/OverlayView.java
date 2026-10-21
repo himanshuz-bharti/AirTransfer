@@ -80,13 +80,14 @@ public class OverlayView extends View{
     public OverlayView(Context context,@Nullable AttributeSet attrs){
         super(context,attrs);
 
-        pointPaint = new Paint();
-        linePaint = new Paint();
+        pointPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
         pointPaint.setStyle(Paint.Style.FILL);
-        linePaint.setStyle(Paint.Style.STROKE);
+        pointPaint.setColor(Color.RED);
 
-        pointPaint.setStrokeWidth(8f);
+        linePaint.setStyle(Paint.Style.STROKE);
+        linePaint.setColor(Color.GREEN);
         linePaint.setStrokeWidth(5f);
 
         framePaint.setStyle(Paint.Style.STROKE);
@@ -157,7 +158,7 @@ public class OverlayView extends View{
                     canvas.drawCircle(
                             x,
                             y,
-                            10f,
+                            14f,
                             pointPaint
                     );
                 }

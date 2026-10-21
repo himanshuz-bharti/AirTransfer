@@ -3,6 +3,8 @@ package com.example.myapplication;
 import android.Manifest;
 import android.content.ContentResolver;
 import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
@@ -11,6 +13,7 @@ import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.drawable.Drawable;
+import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -19,6 +22,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.MediaStore;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
 import android.widget.ImageButton;
@@ -42,15 +46,13 @@ import android.net.Uri;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 
+import com.example.myapplication.Transfer.AirTransferService;
 import com.example.myapplication.Transfer.TransferWebSocketClient;
 import com.example.myapplication.camera.FrameData;
 import com.example.myapplication.camera.FrameProcessor;
 import com.example.myapplication.camera.ImageConverter;
 import com.example.myapplication.camera.PerformaneMonitor;
 import com.example.myapplication.camera.VideoRecorder;
-import com.example.myapplication.frame.FrameCorners;
-import com.example.myapplication.frame.FrameDetector;
-import com.example.myapplication.frame.FramePoint;
 import com.example.myapplication.ui.OverlayView;
 import com.example.myapplication.vision.HandLandMark;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -77,14 +79,13 @@ public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_PERMISSION_CODE = 10;
     private static final int REQUEST_STORAGE_CODE = 11;
     private static final String[] REQUIRED_PERMISSIONS = new String[]{Manifest.permission.CAMERA};
-
+    private static final int REQUEST_OVERLAY_ACCESS=601;
     private FrameProcessor frameProcessor;
     private PreviewView viewFinder;
     private ExecutorService cameraExecutor;
     private HandLandMark handlandmark;
     private PerformaneMonitor performanceMonitor;
 
-    private volatile FrameCorners latestframeCorners;
     private volatile Bitmap latestframe;
 
     private OverlayView overlayView;
@@ -113,7 +114,6 @@ public class MainActivity extends AppCompatActivity {
             uiHandler.postDelayed(this, 200);
         }
     };
-
     private void startRecIndicator(){
         recordingStartedAtMs = SystemClock.elapsedRealtime();
         recIndicator.setVisibility(View.VISIBLE);
@@ -160,47 +160,119 @@ public class MainActivity extends AppCompatActivity {
         filePicker.launch("*/*");
     }
 
-    private final ExecutorService wsExecutor = Executors.newSingleThreadExecutor();
-
-    private void testWebSocket() {
-        try {
-            URI uri = new URI("ws://192.168.1.4:8080");
-            webSocketClient = new TransferWebSocketClient(uri, new TransferWebSocketClient.Listener() {
-                @Override
-                public void onConnected() {
-                    Log.i(TAG, "WebSocket connected");
-                }
-
-                @Override
-                public void onDisconnected() {
-                    Log.i(TAG, "WebSocket disconnected");
-                }
-
-                @Override
-                public void onTextMessage(String message) {
-                    if (fileSender != null) {
-                        fileSender.onTextMessage(message);
+    private final ActivityResultLauncher<Intent> overlaySettingsLauncher =
+            registerForActivityResult(
+                    new ActivityResultContracts.StartActivityForResult(),
+                    result->{
+                        if(Settings.canDrawOverlays(this)){
+                            Log.i(TAG,"overlay settings allowed");
+                            requestImagePermissionIfNeeded();
+                        }
+                        else{
+                            Toast.makeText(this,"Overlay permission is needed for floating button",Toast.LENGTH_SHORT).show();
+                        }
                     }
-                    Log.d(TAG, "WS message: " + message);
-                }
+            );
 
-                @Override
-                public void onError(Exception e) {
-                    Log.e(TAG, "WebSocket error", e);
-                }
-            });
-            wsExecutor.execute(() -> {
-                try {
-                    webSocketClient.connect();
-                } catch (Exception e) {
-                    Log.e(TAG, "Connect failed", e);
-                }
-            });
-        } catch (Exception e) {
-            Log.e(TAG, "testWebSocket error", e);
+    private final ActivityResultLauncher<String []> imagePermissionLauncher =
+            registerForActivityResult(
+                    new ActivityResultContracts.RequestMultiplePermissions(),
+                    result->{
+                        boolean canReadImages = false;
+                        for(Boolean granted: result.values()){
+                            if(Boolean.TRUE.equals(granted)){
+                                canReadImages = true; break;
+                            }
+                        }
+                        if(canReadImages){
+                            requestProjectionConsent();
+                        }
+                        else{
+                            Toast.makeText(this,"Image read permission is needed",
+                                    Toast.LENGTH_SHORT).show();
+                        }
+                    }
+            );
+
+    private final ActivityResultLauncher<Intent> projectionRequest =
+            registerForActivityResult(
+                    new ActivityResultContracts.StartActivityForResult(),
+                    result->{
+                        Log.i(TAG,"projectionRequest launched");
+                        if(result.getResultCode() != RESULT_OK || result.getData()==null){
+                            Toast.makeText(this,"Screen capture permission denied",
+                                    Toast.LENGTH_SHORT).show();
+                            return;
+                        }
+                        Log.i(TAG,"Screen capture permission given");
+                        Intent serviceIntent = new Intent(this, AirTransferService.class);
+                        serviceIntent.putExtra(AirTransferService.EXTRA_RESULT_CODE,result.getResultCode());
+                        serviceIntent.putExtra(AirTransferService.EXTRA_RESULT_DATA,result.getData());
+
+                        ContextCompat.startForegroundService(this,serviceIntent);
+                    }
+            );
+    private void beginAirTransferSetup(){
+        if(!Settings.canDrawOverlays(this)){
+            Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:"+getPackageName()));
+
+            overlaySettingsLauncher.launch(intent);
+            return;
+        }
+        requestProjectionConsent();
+    }
+
+    private void requestImagePermissionIfNeeded(){
+        if(Build.VERSION.SDK_INT >= 34){
+            boolean hasfullAccess = ContextCompat.checkSelfPermission(this,
+                    Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED;
+
+            boolean haslimitedAccess = ContextCompat.checkSelfPermission(this,
+                    Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) == PackageManager.PERMISSION_GRANTED;
+
+            if(hasfullAccess || haslimitedAccess){
+                requestProjectionConsent();
+            }
+            else{
+                imagePermissionLauncher.launch(new String []{
+                        Manifest.permission.READ_MEDIA_IMAGES,
+                        Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED
+                });
+            }
+        }
+        else if(Build.VERSION.SDK_INT>=33){
+            if(ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED){
+                Log.i(TAG,"Image permission granted");
+                requestProjectionConsent();
+            }
+            else{
+                imagePermissionLauncher.launch(new String []{
+                        Manifest.permission.READ_MEDIA_IMAGES,
+                });
+            }
+        }
+        else{
+            if(ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED){
+                Log.i(TAG,"Image permission granted");
+                requestProjectionConsent();
+            }
+            else{
+                imagePermissionLauncher.launch(new String []{
+                        Manifest.permission.READ_EXTERNAL_STORAGE,
+                });
+            }
         }
     }
 
+    private void requestProjectionConsent(){
+        MediaProjectionManager manager = (MediaProjectionManager) getSystemService(
+                Context.MEDIA_PROJECTION_SERVICE
+        );
+        if(manager!=null) {
+            projectionRequest.launch(manager.createScreenCaptureIntent());
+        }
+    }
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -216,18 +288,7 @@ public class MainActivity extends AppCompatActivity {
         recTimer = findViewById(R.id.recTimer);
         recDot = findViewById(R.id.recDot);
 
-        // Initialize file sender safely
-        // Note: webSocketClient is created elsewhere in your code if you have it.
-        // If it's not initialized yet, fileSender will be null; the button will guard against it.
-        Log.i(TAG,"Before websockets initialization");
-        testWebSocket();
-        Log.i(TAG,"After websockets initialization");
-        if (webSocketClient != null) {
-            fileSender = new TransferFileSender(webSocketClient);
-        } else {
-            fileSender = null;
-        }
-
+        findViewById(R.id.btnEnableAirTransfer).setOnClickListener(view->beginAirTransferSetup());
         // Set up send file button (guarded if connection not ready)
         ImageButton btnSendFile = findViewById(R.id.btnSendFile);
         if (btnSendFile != null) {
@@ -244,25 +305,11 @@ public class MainActivity extends AppCompatActivity {
                 new HandLandMark.ResultListener() {
                     @Override
                     public void onResult(HandLandmarkerResult result, int imageWidth, int imageHeight, int rotationDegrees) {
-                        Log.d(TAG, "MediaPipe image = " + imageWidth + "x" + imageHeight
-                                + " | Overlay = " + overlayView.getWidth()
-                                + "x" + overlayView.getHeight());
-
-                        FrameCorners frameCorners = FrameDetector.detect(result);
-                        latestframeCorners = frameCorners;
-                        if(frameCorners != null) {
-                            Log.i(TAG, "TL = " + frameCorners.getTopleft().x
-                                    + "," + frameCorners.getTopleft().y);
-                            Log.i(TAG, "BL = " + frameCorners.getBottomleft().x
-                                    + "," + frameCorners.getBottomleft().y);
-                            Log.i(TAG, "TR = " + frameCorners.getTopright().x
-                                    + "," + frameCorners.getTopright().y);
-                            Log.i(TAG, "BR = " + frameCorners.getBottomright().x
-                                    + "," + frameCorners.getBottomright().y);
-                        }
+//                        Log.d(TAG, "MediaPipe image = " + imageWidth + "x" + imageHeight
+//                                + " | Overlay = " + overlayView.getWidth()
+//                                + "x" + overlayView.getHeight());
 
                         overlayView.setResult(result.landmarks(), imageWidth, imageHeight, rotationDegrees);
-                        overlayView.setFrameCorners(frameCorners);
                     }
 
                     @Override
@@ -297,15 +344,9 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        final FrameCorners corners = latestframeCorners;
-
         captureExecutor.execute(() -> {
             Bitmap out = capturedFrame.copy(Bitmap.Config.ARGB_8888, true);
             if(out == null) return;
-
-            if(corners != null){
-                drawQuad(corners, out);
-            }
 
             long currentTimeMs = System.currentTimeMillis();
             String filename = "hand_" + currentTimeMs + ".png";
@@ -377,41 +418,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void drawQuad(FrameCorners fc, Bitmap bmp){
-        FramePoint tl = fc.getTopleft();
-        FramePoint tr = fc.getTopright();
-        FramePoint bl = fc.getBottomleft();
-        FramePoint br = fc.getBottomright();
 
-        if(tl == null || tr == null || bl == null || br == null) return;
-        Path quad = new Path();
-        float w = bmp.getWidth(), h = bmp.getHeight();
-
-        quad.moveTo(tl.x * w, tl.y * h);
-        quad.lineTo(tr.x * w, tr.y * h);
-        quad.lineTo(br.x * w, br.y * h);
-        quad.lineTo(bl.x * w, bl.y * h);
-        quad.close();
-
-        Canvas canvas = new Canvas(bmp);
-        float stroke = Math.max(6f, bmp.getWidth() / 60f);
-
-        Paint halo = new Paint(Paint.ANTI_ALIAS_FLAG);
-        halo.setStyle(Paint.Style.STROKE);
-        halo.setStrokeWidth(stroke * 2.2f);
-        halo.setColor(Color.argb(160, 0, 0, 0));
-        halo.setStrokeCap(Paint.Cap.ROUND);
-        halo.setStrokeJoin(Paint.Join.ROUND);
-        canvas.drawPath(quad, halo);
-
-        Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
-        line.setStyle(Paint.Style.STROKE);
-        line.setStrokeWidth(stroke);
-        line.setColor(Color.CYAN);
-        line.setStrokeCap(Paint.Cap.ROUND);
-        line.setStrokeJoin(Paint.Join.ROUND);
-        canvas.drawPath(quad, line);
-    }
 
     private void startCamera(){
         requestStorageIfNeeded();
@@ -452,21 +459,16 @@ public class MainActivity extends AppCompatActivity {
                         // Keep a copy of the rotated frame for capture / recording
                         latestframe = rotatedBitmap;
 
-                        final FrameCorners cornersForRecording = latestframeCorners;
-
                         if (isRecording) {
                             Bitmap recordCopy = rotatedBitmap.copy(Bitmap.Config.ARGB_8888, true);
-                            if (cornersForRecording != null) {
-                                drawQuad(cornersForRecording, recordCopy);
-                            }
                             videoExecutor.execute(() -> videoRecorder.queueFrame(recordCopy));
                         }
 
                         performanceMonitor.onFrameEnd(frameStartTime);
-                        Log.i(TAG, "width:" + data.getWidth() + " height:" + data.getheight()
-                                + " rotationdegree:" + data.getrotationDegree() + " timestamp:" + data.getTimeStamp()
-                                + " FPS:" + performanceMonitor.getfps()
-                                + " lastframetimems:" + performanceMonitor.getLastFrameTimeMs());
+//                        Log.i(TAG, "width:" + data.getWidth() + " height:" + data.getheight()
+//                                + " rotationdegree:" + data.getrotationDegree() + " timestamp:" + data.getTimeStamp()
+//                                + " FPS:" + performanceMonitor.getfps()
+//                                + " lastframetimems:" + performanceMonitor.getLastFrameTimeMs());
 
                     } finally {
                         image.close();
