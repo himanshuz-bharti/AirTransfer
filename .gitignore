@@ -13,3 +13,5 @@
 .externalNativeBuild
 .cxx
 local.properties
+# Downloaded OpenCV Android SDK used by the local CMake build.
+/OpenCV-android-sdk/

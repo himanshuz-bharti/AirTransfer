@@ -1,6 +1,23 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
 }
+
+// Machine-local OpenCV SDK location. local.properties is ignored by Git.
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.inputStream().use { input ->
+        localProperties.load(input)
+    }
+}
+
+val openCvSdkRoot = localProperties.getProperty("opencv.sdk.dir")
+    ?.trim()
+    ?.replace("\\", "/")
+
+val openCvConfigDir = openCvSdkRoot?.let { "$it/sdk/native/jni" }
 
 android {
     namespace = "com.example.myapplication"
@@ -16,6 +33,15 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++17"
+                if (openCvConfigDir != null) {
+                    arguments += "-DOpenCV_DIR=$openCvConfigDir"
+                }
+            }
+        }
     }
 
     buildTypes {
@@ -31,6 +57,14 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
 }
 
 dependencies {
@@ -57,9 +91,6 @@ dependencies {
         implementation("org.java-websocket:Java-WebSocket:1.6.0")
         implementation("com.squareup.okhttp3:okhttp:5.5.0")
 
-
-    //opencv
-        implementation("org.opencv:opencv:4.14.0")
 
         // Guava for Async Futures handling in Java
         implementation("com.google.guava:guava:31.1-android")

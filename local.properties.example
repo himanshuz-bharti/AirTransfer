@@ -1,0 +1,3 @@
+# Copy this file to local.properties, then set the path to your extracted
+# OpenCV-android-sdk directory. Use forward slashes on Windows.
+opencv.sdk.dir=D:/path/to/OpenCV-android-sdk

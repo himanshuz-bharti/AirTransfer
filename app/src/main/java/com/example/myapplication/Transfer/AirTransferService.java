@@ -8,6 +8,7 @@ import android.app.Service;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
@@ -32,10 +33,14 @@ import android.view.WindowManager;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.net.URI;
+import java.util.concurrent.ExecutorService;
+
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
 import com.example.myapplication.MainActivity;
+import com.example.myapplication.utils.BitmapDumpUtil;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -69,13 +74,20 @@ public class AirTransferService extends Service {
 
     private Handler captureHandler;
     private HandlerThread captureThread;
-
-    private boolean captureRequested;
     private boolean resourceReleased;
 
     private WindowManager windowManager;
     private TextView bubble;
     private boolean bubbleAdded;
+
+    private final ExecutorService galleryMatchExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService wsExecutor = Executors.newSingleThreadExecutor();
+
+    private TransferWebSocketClient webSocketClient;
+    private TransferFileSender fileSender;
+    private static final String PREFS_NAME = "airtransfer_prefs";
+    private static final String PREF_WS_IP = "ws_ip";
+    private static final String DEFAULT_WS_URI = "ws://192.168.1.4:8080";
 
     private final MediaProjection.Callback projectionCallback =
             new MediaProjection.Callback() {
@@ -96,7 +108,51 @@ public class AirTransferService extends Service {
         super.onCreate();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         createNotificationChannel();
-        //connectWebSocket();
+        connectWebSocket();
+    }
+
+    private void connectWebSocket(){
+        try{
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String ip = prefs.getString(PREF_WS_IP, "192.168.1.4");
+            String uriStr = "ws://" + ip + ":8080";
+            URI uri = new URI(uriStr);
+            webSocketClient = new TransferWebSocketClient(uri, new TransferWebSocketClient.Listener() {
+                @Override
+                public void onConnected() {
+                    Log.i(TAG, "WebSocket connected in AirTransferService");
+                    mainHandler.post(() -> Toast.makeText(AirTransferService.this, "Connected to receiver", Toast.LENGTH_SHORT).show());
+                }
+
+                @Override
+                public void onDisconnected() {
+                    Log.i(TAG, "WebSocket disconnected in AirTransferService");
+                }
+
+                @Override
+                public void onError(Exception e) {
+                    Log.e(TAG, "WebSocket error in AirTransferService", e);
+                }
+
+                @Override
+                public void onTextMessage(String message) {
+                    if (fileSender != null) {
+                        fileSender.onTextMessage(message);
+                    }
+                    Log.d(TAG, "WS message: " + message);
+                }
+            });
+            fileSender = new TransferFileSender(webSocketClient);
+            wsExecutor.execute(() -> {
+                try {
+                    webSocketClient.connect();
+                } catch (Exception e) {
+                    Log.e(TAG, "Connection failed", e);
+                }
+            });
+        } catch (Exception e) {
+            Log.e(TAG, "connectWebSocket failed", e);
+        }
     }
 
     @Override
@@ -299,7 +355,71 @@ public class AirTransferService extends Service {
             }
 
             bitmap = imageToBitmap(image);
-            saveCapturedBitmap(bitmap);
+
+            if(bitmap == null){
+                Log.i(TAG,"Error in convertung from image to bitmap");
+                return;
+            }
+
+            try{
+                Uri dumpImageUri = BitmapDumpUtil.dumpBitmap(getApplicationContext(),
+                        bitmap,"AirTransfer","Screen");
+                Log.i(TAG,"ScreenShot saved to"+dumpImageUri);
+            } catch(IOException e){
+                Log.e(TAG,"Could not save the image"+e);
+            }
+
+            Bitmap bitmapForMatching = bitmap.copy(Bitmap.Config.ARGB_8888,false);
+            galleryMatchExecutor.execute(()->{
+                try{
+                    GalleryImageMatcher.MatchResult matchResult = GalleryImageMatcher.findBestMatch(
+                            getApplicationContext(),bitmapForMatching
+                    );
+
+                    if(!matchResult.hasCandidate()){
+                        Log.i(TAG,"No matching candidate was found. Images checked:"+
+                                matchResult.galleryImagesChecked);
+
+                        mainHandler.post(()->{
+                            Toast.makeText(getApplicationContext(),"No images match found",Toast.LENGTH_SHORT)
+                                    .show();
+                        });
+                        return;
+                    }
+
+                    Log.i(TAG,"Best gallery candidate: "+ matchResult.bestDisplayName
+                               + " best uri:" + matchResult.bestUri
+                               + " Inlier count" + matchResult.inlierCount
+                               + " Inlier ratio" + matchResult.inlierRatio);
+
+                    String message = (matchResult.Confident?"Gallery match: ":"Possible match: ")
+                            + matchResult.bestDisplayName;
+
+                    mainHandler.post(()->{
+                        Toast.makeText(getApplicationContext(),message,Toast.LENGTH_SHORT).show();
+                    });
+                    if(matchResult.Confident) {
+                        try {
+                            Uri matchedUri = BitmapDumpUtil.copyImageToPictures(getApplicationContext(),
+                                    matchResult.bestUri, "AirTransfer");
+                            Log.i(TAG, "Matched image copied to gallery" + matchedUri);
+                        } catch (IOException e) {
+                            Log.e(TAG, "Could not copy matched image");
+                        }
+                    }
+                    // If we have a confident match, send the original file from gallery
+
+
+                }catch(RuntimeException e){
+                    Log.e(TAG,"Gallery matching failed"+e);
+                } finally{
+                    if(bitmapForMatching!=null && !bitmapForMatching.isRecycled()){
+                        bitmapForMatching.recycle();
+                    }
+                }
+            });
+
+           // saveCapturedBitmap(bitmap);
             bitmap = null;
             mainHandler.post(()->{
                 if(bubble!=null) {
@@ -363,44 +483,6 @@ public class AirTransferService extends Service {
         return screenBitmap;
 
     }
-
-    private void saveCapturedBitmap(Bitmap bitmap) throws IOException{
-        File pictureDirectory = getExternalFilesDir(Environment.DIRECTORY_PICTURES);
-        if(pictureDirectory == null){
-            bitmap.recycle();
-            throw new IOException("Picture directory unavailable");
-        }
-
-        File outputDirectory = new File(pictureDirectory,"AirTransferService");
-        if(!outputDirectory.exists()){
-            if(!outputDirectory.mkdirs()){
-                throw new IOException("Failed to create output directory");
-            }
-        }
-
-        File outputFile = new File(outputDirectory, "screen_" +
-                System.currentTimeMillis()+".png");
-
-        try(FileOutputStream stream = new FileOutputStream(outputFile)){
-            boolean compressed = bitmap.compress(
-                    Bitmap.CompressFormat.PNG,
-                    100,
-                    stream
-            );
-
-            if(!compressed){
-                throw new IOException("Failed to compress bitmap");
-            }
-
-
-            stream.flush();
-        } finally {
-            bitmap.recycle();
-        }
-
-        Log.i(TAG, "Saved image: " + outputFile.getAbsolutePath());
-    }
-
     private void releaseCaptureResources(boolean stopProjection){
         if(resourceReleased){
             return;
