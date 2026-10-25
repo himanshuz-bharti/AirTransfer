@@ -183,7 +183,7 @@ public class GalleryImageMatcher {
             }
         }
         if(bestUri == null){
-            return MatchResult.noMatch(0);
+            return MatchResult.noMatch(imageCompared);
         }
         boolean confident = bestInliers >= MIN_INLINERS && bestInlierRatio >= MIN_INLINER_RATIO;
 

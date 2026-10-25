@@ -114,8 +114,9 @@ public class AirTransferService extends Service {
     private void connectWebSocket(){
         try{
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-            String ip = prefs.getString(PREF_WS_IP, "192.168.1.4");
+            String ip = prefs.getString(PREF_WS_IP, "192.168.1.26");
             String uriStr = "ws://" + ip + ":8080";
+            Log.i(TAG, "Connecting to " + uriStr);
             URI uri = new URI(uriStr);
             webSocketClient = new TransferWebSocketClient(uri, new TransferWebSocketClient.Listener() {
                 @Override
@@ -361,13 +362,13 @@ public class AirTransferService extends Service {
                 return;
             }
 
-            try{
-                Uri dumpImageUri = BitmapDumpUtil.dumpBitmap(getApplicationContext(),
-                        bitmap,"AirTransfer","Screen");
-                Log.i(TAG,"ScreenShot saved to"+dumpImageUri);
-            } catch(IOException e){
-                Log.e(TAG,"Could not save the image"+e);
-            }
+//            try{
+//                Uri dumpImageUri = BitmapDumpUtil.dumpBitmap(getApplicationContext(),
+//                        bitmap,"AirTransfer","Screen");
+//                Log.i(TAG,"ScreenShot saved to"+dumpImageUri);
+//            } catch(IOException e){
+//                Log.e(TAG,"Could not save the image"+e);
+//            }
 
             Bitmap bitmapForMatching = bitmap.copy(Bitmap.Config.ARGB_8888,false);
             galleryMatchExecutor.execute(()->{
@@ -406,10 +407,22 @@ public class AirTransferService extends Service {
                         } catch (IOException e) {
                             Log.e(TAG, "Could not copy matched image");
                         }
+
+                        TransferWebSocketClient client = webSocketClient;
+                        TransferFileSender sender = fileSender;
+                        if(client == null || sender==null){
+                            Log.e(TAG,"Cannot send, laptop websocket server is not connected");
+                            mainHandler.post(()->{
+                                Toast.makeText(getApplicationContext(),"Server is not connected",Toast.LENGTH_SHORT).show();
+                            });
+                        }
+                        else{
+                            Log.i(TAG,"Image before being sent over websocket" + matchResult.bestDisplayName);
+                            sender.sendFile(getContentResolver(),matchResult.bestUri);
+                            Log.i(TAG,"Image sent over websocket" + matchResult.bestDisplayName);
+                        }
                     }
                     // If we have a confident match, send the original file from gallery
-
-
                 }catch(RuntimeException e){
                     Log.e(TAG,"Gallery matching failed"+e);
                 } finally{
@@ -570,43 +583,4 @@ public class AirTransferService extends Service {
                         stopPendingIntent)
                 .build();
     }
-//    private void connectWebSocket(){
-//        try{
-//            webSocketClient = new TransferWebSocketClient(new URI(WS_URI), new TransferWebSocketClient.Listener() {
-//                @Override
-//                public void onConnected() {
-//                    Log.i(TAG,"Websocket connected");
-//                }
-//
-//                @Override
-//                public void onDisconnected() {
-//                    Log.i(TAG,"Websocket disconnected");
-//                }
-//
-//                @Override
-//                public void onError(Exception e) {
-//                    Log.i(TAG,"Websocket connection error",e);
-//                }
-//
-//                @Override
-//                public void onTextMessage(String message) {
-//                    TransferFileSender sender = fileSender;
-//                    if(sender!=null){
-//                        sender.onTextMessage(message);
-//                    }
-//                }
-//            });
-//            fileSender = new TransferFileSender(webSocketClient);
-//            wsExecutor.execute(()->{
-//                try{
-//                    webSocketClient.connect();
-//                } catch (Exception e) {
-//                    Log.i(TAG,"Connection failed",e);
-//                }
-//            });
-//        } catch(Exception e){
-//            Log.i(TAG,"connectWebSocket",e);
-//        }
-//    }
-
 }

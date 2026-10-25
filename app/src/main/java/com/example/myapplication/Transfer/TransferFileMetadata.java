@@ -1,5 +1,6 @@
 package com.example.myapplication.Transfer;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.UUID;
@@ -45,10 +46,13 @@ public class TransferFileMetadata {
         return transferId;
     }
 
-    public String encodeFileName(){
-        return Base64.getUrlEncoder()
-                .withoutPadding()
-                .encodeToString(fileName.getBytes(StandardCharsets.UTF_8));
+    public String decodeFileName() {
+        byte[] decoded = Base64.getUrlDecoder().decode(fileName);
+        return new String(decoded, StandardCharsets.UTF_8);
+    }
+
+    public boolean validFileSize(long MAX_FILE_SIZE){
+        return !(fileSize < 0 || fileSize > MAX_FILE_SIZE);
     }
 
     public static String newtransferId(){

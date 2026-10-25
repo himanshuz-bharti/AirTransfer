@@ -67,7 +67,10 @@ public class TransferFileSender {
         String filename = fileName(resolver,uri);
         Long fileSize = fileSize(resolver,uri);
 
-        if(fileSize<=0){
+        if(filename == null || filename.trim().isEmpty())  {
+            throw new IllegalArgumentException("Filename is invalid");
+        }
+        if(fileSize == null || fileSize<=0){
             throw new IllegalArgumentException("Filesize is null");
         }
 
@@ -79,7 +82,7 @@ public class TransferFileSender {
             Log.i(TAG,"before startransfer");
             startTransfer(resolver,uri,filename,fileSize,transferId);
         } catch(Exception e){
-            e.printStackTrace();
+            Log.e(TAG,"Error in sending fire through websockets",e);
         } finally{
             connected = false;
             currentTransferId = null;
