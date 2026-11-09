@@ -13,7 +13,7 @@ public class RoleChooserActivity extends AppCompatActivity{
         setContentView(R.layout.activity_role_chooser);
 
         findViewById(R.id.btnSender).setOnClickListener(view->{
-            startActivity(new Intent(this,MainActivity.class));
+            startActivity(new Intent(this,SenderDiscoveryActivity.class));
         });
 
         findViewById(R.id.btnReceiver).setOnClickListener(view->{

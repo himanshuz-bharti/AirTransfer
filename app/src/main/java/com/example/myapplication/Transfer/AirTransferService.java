@@ -40,6 +40,7 @@ import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
 import com.example.myapplication.MainActivity;
+import com.example.myapplication.SenderDiscoveryActivity;
 import com.example.myapplication.utils.BitmapDumpUtil;
 
 import java.io.File;
@@ -108,14 +109,18 @@ public class AirTransferService extends Service {
         super.onCreate();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         createNotificationChannel();
-        connectWebSocket();
     }
 
-    private void connectWebSocket(){
+    private void connectWebSocket(String selectedhost, int selectedport){
         try{
-            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-            String ip = prefs.getString(PREF_WS_IP, "192.168.1.26");
-            String uriStr = "ws://" + ip + ":8080";
+            String host = selectedhost;
+
+            if(host==null || host.trim().isEmpty()){
+                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                host = prefs.getString(PREF_WS_IP, "192.168.1.26");
+            }
+
+            String uriStr = "ws://" + host + ":" + selectedport;
             Log.i(TAG, "Connecting to " + uriStr);
             URI uri = new URI(uriStr);
             webSocketClient = new TransferWebSocketClient(uri, new TransferWebSocketClient.Listener() {
@@ -185,6 +190,13 @@ public class AirTransferService extends Service {
         }
 
         startForegroundForeground();
+
+        String peerHost = intent.getStringExtra(SenderDiscoveryActivity.EXTRA_PEER_HOST);
+        int peerPort = intent.getIntExtra(SenderDiscoveryActivity.EXTRA_PEER_PORT, 8080);
+
+        if(webSocketClient == null){
+            connectWebSocket(peerHost,peerPort);
+        }
 
         startProjection(resultCode,resultData);
         return START_NOT_STICKY;

@@ -52,6 +52,8 @@ public class TransferWebSocketServer extends WebSocketServer{
     private Path finalFile;
     private Path chunkFile;
 
+    private Runnable serverStartedListener;
+
     public TransferWebSocketServer(Context appContext,int port, Path recieveDirectory){
         super(new InetSocketAddress(port));
         this.appContext = appContext.getApplicationContext();
@@ -148,8 +150,14 @@ public class TransferWebSocketServer extends WebSocketServer{
     @Override
     public void onStart(){
         Log.i(TAG,"Websocket server started on port ]:" + getPort());
+        if(serverStartedListener != null){
+            serverStartedListener.run();
+        }
     }
 
+    public void setServerStartedListener(Runnable listener){
+        this.serverStartedListener = listener;
+    }
     public void sendMessage(String message){
         if(connectClient!=null && connectClient.isOpen()){
             connectClient.send(message);

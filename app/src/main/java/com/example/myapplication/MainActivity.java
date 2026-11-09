@@ -47,6 +47,7 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 
 import com.example.myapplication.Transfer.AirTransferService;
+import com.example.myapplication.Transfer.NSDTransferDiscovery;
 import com.example.myapplication.Transfer.TransferWebSocketClient;
 import com.example.myapplication.camera.FrameData;
 import com.example.myapplication.camera.FrameProcessor;
@@ -205,9 +206,15 @@ public class MainActivity extends AppCompatActivity {
                             return;
                         }
                         Log.i(TAG,"Screen capture permission given");
+
+                        String host = getIntent().getStringExtra(SenderDiscoveryActivity.EXTRA_PEER_HOST);
+                        String port = getIntent().getStringExtra(SenderDiscoveryActivity.EXTRA_PEER_PORT);
+
                         Intent serviceIntent = new Intent(this, AirTransferService.class);
                         serviceIntent.putExtra(AirTransferService.EXTRA_RESULT_CODE,result.getResultCode());
                         serviceIntent.putExtra(AirTransferService.EXTRA_RESULT_DATA,result.getData());
+                        serviceIntent.putExtra(SenderDiscoveryActivity.EXTRA_PEER_HOST,host);
+                        serviceIntent.putExtra(SenderDiscoveryActivity.EXTRA_PEER_PORT,port);
 
                         ContextCompat.startForegroundService(this,serviceIntent);
                     }
