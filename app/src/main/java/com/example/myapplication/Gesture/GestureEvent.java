@@ -1,17 +1,22 @@
 package com.example.myapplication.Gesture;
 
+import android.util.Log;
+
 public class GestureEvent {
+    private static final String TAG = "GestureEvent";
+
     public enum Kind{
         GRAB,
         RELEASE
     }
 
-    public Kind kind;
+    private final Kind kind;
     public GestureEvent(Kind kind){
         if(kind == null){
             throw new IllegalArgumentException("kind must not be null");
         }
         this.kind = kind;
+        Log.i(TAG, "Created gesture event: " + kind);
     }
 
     public Kind getKind(){

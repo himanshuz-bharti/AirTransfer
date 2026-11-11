@@ -4,13 +4,11 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
-import android.app.Service;
-import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
+import android.graphics.Matrix;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.GradientDrawable;
 import android.hardware.display.DisplayManager;
@@ -21,41 +19,77 @@ import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
 import android.os.Build;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.os.IBinder;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.util.Size;
 import android.view.Gravity;
 import android.view.WindowManager;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.net.URI;
-import java.util.concurrent.ExecutorService;
-
-import androidx.annotation.Nullable;
-import androidx.core.app.NotificationCompat;
-
-import com.example.myapplication.MainActivity;
-import com.example.myapplication.SenderDiscoveryActivity;
-import com.example.myapplication.utils.BitmapDumpUtil;
-
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.net.URI;
 import java.nio.ByteBuffer;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.core.app.NotificationCompat;
+import androidx.core.content.ContextCompat;
+import androidx.lifecycle.LifecycleService;
 
-public class AirTransferService extends Service {
+import com.example.myapplication.Gesture.GestureDebouncer;
+import com.example.myapplication.Gesture.GestureEvent;
+import com.example.myapplication.Gesture.GestureType;
+import com.example.myapplication.vision.HandGestureClassifier;
+import com.example.myapplication.camera.ImageConverter;
+import com.google.common.util.concurrent.ListenableFuture;
+
+
+import java.io.File;
+
+
+public class AirTransferService extends LifecycleService {
+
+    private enum RoleState{
+        IDLE,
+        SENDER_WAITING,
+        SENDER_CONNECTING,
+        SENDER_SENDING,
+        RECIEVER_STARTING,
+        RECIEVER_LISTENING
+    }
+
+    private static final int RECIEVER_PORT = 8080;
+    private static final long SENDER_TIMEOUT_MS = 60000L;
+    private static final long RECIEVER_TIMEOUT_MS = 10000L;
+
+    private RoleState roleState = RoleState.IDLE;
+    private NSDTransferDiscovery nsdTransferDiscovery;
+    private TransferWebSocketServer recieverServer;
+    private NSDTransferDiscovery.Peer pendingReciever;
+    private Uri pendingItemUri;
+
+    private final Runnable senderTimeout = () ->{
+        if(roleState == RoleState.SENDER_WAITING || roleState == RoleState.SENDER_CONNECTING){
+            finishSenderAttempt("Timed out waiting for reciever or transfer");
+        }
+    };
+    private final Runnable receiverStartupTimeout = () -> {
+        if (roleState == RoleState.RECIEVER_STARTING) {
+            stopRecieverMode();
+            showStatus("Receiver server did not start.");
+        }
+    };
+
     private static final String TAG = "AirTransferService";
     private static final String CHANNEL_ID = "air_transfer";
     private static final int NOTIFICATION_ID = 4101;
@@ -86,9 +120,71 @@ public class AirTransferService extends Service {
 
     private TransferWebSocketClient webSocketClient;
     private TransferFileSender fileSender;
-    private static final String PREFS_NAME = "airtransfer_prefs";
-    private static final String PREF_WS_IP = "ws_ip";
-    private static final String DEFAULT_WS_URI = "ws://192.168.1.4:8080";
+    private ProcessCameraProvider cameraProvider;
+    private ImageAnalysis imageAnalysis;
+    private ExecutorService cameraExecutor;
+    private final GestureDebouncer gestureDebouncer = new GestureDebouncer();
+
+    private HandGestureClassifier handGestureClassifier;
+
+    private void startGestureCamera(){
+
+        if(cameraExecutor!=null){
+            return;
+        }
+
+        cameraExecutor = Executors.newSingleThreadExecutor();
+
+        ListenableFuture<ProcessCameraProvider> cameraProviderFuture = ProcessCameraProvider.getInstance(this);
+        cameraProviderFuture.addListener(() -> {
+            try{
+                cameraProvider = cameraProviderFuture.get();
+
+                imageAnalysis = new ImageAnalysis.Builder()
+                        .setTargetResolution(new Size(640,480))
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                        .build();
+
+                imageAnalysis.setAnalyzer(cameraExecutor, image -> {
+                    long frameStartTime = System.nanoTime();
+                    try{
+                        Bitmap imgbitmap = ImageConverter.toBitmap(image);
+
+                        long timestampMs = image.getImageInfo().getTimestamp() / 1_000_000L;
+                        int rotationDegrees = image.getImageInfo().getRotationDegrees();
+
+                        // Rotate to upright + mirror horizontally (front camera)
+                        Matrix matrix = new Matrix();
+                        matrix.postRotate(rotationDegrees);
+                        matrix.postScale(-1f, 1f);
+                        Bitmap rotatedBitmap = Bitmap.createBitmap(imgbitmap, 0, 0,
+                                imgbitmap.getWidth(), imgbitmap.getHeight(), matrix, true);
+
+                        if(rotatedBitmap !=null && rotatedBitmap != imgbitmap){
+                            imgbitmap.recycle();
+                        }
+                        // Run hand landmark detection on the upright, mirrored frame
+                        // handLandMark.detectAsync(rotatedBitmap, timestampMs, rotationDegrees);
+                        handGestureClassifier.detectAsync(rotatedBitmap, timestampMs);
+                    } finally {
+                        image.close();
+                    }
+                });
+
+                CameraSelector camSelector = CameraSelector.DEFAULT_FRONT_CAMERA;
+
+                try {
+                    cameraProvider.unbindAll();
+                    cameraProvider.bindToLifecycle(this, camSelector, imageAnalysis);
+                } catch(Exception ex){
+                    Log.e(TAG, "Usecase binding failed", ex);
+                }
+            } catch(ExecutionException | InterruptedException e){
+                Log.e(TAG, "Error getting camera provider" + e);
+            }
+        }, ContextCompat.getMainExecutor(this));
+    }
 
     private final MediaProjection.Callback projectionCallback =
             new MediaProjection.Callback() {
@@ -109,60 +205,178 @@ public class AirTransferService extends Service {
         super.onCreate();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         createNotificationChannel();
+        initializeNSD();
     }
 
-    private void connectWebSocket(String selectedhost, int selectedport){
-        try{
-            String host = selectedhost;
-
-            if(host==null || host.trim().isEmpty()){
-                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-                host = prefs.getString(PREF_WS_IP, "192.168.1.26");
-            }
-
-            String uriStr = "ws://" + host + ":" + selectedport;
-            Log.i(TAG, "Connecting to " + uriStr);
-            URI uri = new URI(uriStr);
-            webSocketClient = new TransferWebSocketClient(uri, new TransferWebSocketClient.Listener() {
-                @Override
-                public void onConnected() {
-                    Log.i(TAG, "WebSocket connected in AirTransferService");
-                    mainHandler.post(() -> Toast.makeText(AirTransferService.this, "Connected to receiver", Toast.LENGTH_SHORT).show());
-                }
-
-                @Override
-                public void onDisconnected() {
-                    Log.i(TAG, "WebSocket disconnected in AirTransferService");
-                }
-
-                @Override
-                public void onError(Exception e) {
-                    Log.e(TAG, "WebSocket error in AirTransferService", e);
-                }
-
-                @Override
-                public void onTextMessage(String message) {
-                    if (fileSender != null) {
-                        fileSender.onTextMessage(message);
+    private void initializeNSD(){
+        nsdTransferDiscovery = new NSDTransferDiscovery(
+                getApplicationContext(),
+                new NSDTransferDiscovery.Listener() {
+                    @Override
+                    public void onStatus(String message) {
+                        Log.i(TAG,"NSD:"+message);
                     }
-                    Log.d(TAG, "WS message: " + message);
+
+                    @Override
+                    public void onPeerFound(NSDTransferDiscovery.Peer peer) {
+                        Log.i(TAG, "NSD_PEER_CALLBACK role=" + roleState + " peer=" + peer);
+                        if(roleState != RoleState.SENDER_WAITING){
+                            return;
+                        }
+
+                        if(pendingReciever == null){
+                            pendingReciever = peer;
+                        }
+                        maybeConnectToReciever();
+                    }
+
+                    @Override
+                    public void onPeerLost(NSDTransferDiscovery.Peer peer) {
+                        Log.i(TAG,"NSD reciever lost");
+
+                        if(pendingReciever != null && pendingReciever.serviceName.equals(peer.serviceName)
+                                && roleState == RoleState.SENDER_WAITING){
+                            pendingReciever = null;
+                        }
+                    }
+
+                    @Override
+                    public void onError(String message, int errorCode) {
+                        Log.e(TAG,"NSD error:"+message + ":code"+errorCode);
+                        if(roleState == RoleState.SENDER_WAITING){
+                            finishSenderAttempt(message);
+                        }
+                        else if(roleState == RoleState.RECIEVER_STARTING
+                                || roleState == RoleState.RECIEVER_LISTENING){
+                            stopRecieverMode();
+                            showStatus(message);
+                        }
+                    }
                 }
-            });
-            fileSender = new TransferFileSender(webSocketClient);
-            wsExecutor.execute(() -> {
-                try {
-                    webSocketClient.connect();
-                } catch (Exception e) {
-                    Log.e(TAG, "Connection failed", e);
+        );
+    }
+
+    private void initializeHandGestureClassifier(){
+        if(handGestureClassifier != null){
+            return;
+        }
+
+        handGestureClassifier = new HandGestureClassifier(
+                getApplicationContext(),
+                new HandGestureClassifier.Listener() {
+                    @Override
+                    public void onObservation(
+                            GestureType pose,
+                            boolean handDetected,
+                            float openScore,
+                            float closedScore
+                    ) {
+                        GestureEvent event = gestureDebouncer.update(
+                                pose,
+                                handDetected,
+                                SystemClock.elapsedRealtime()
+                        );
+                        if(event != null){
+                            mainHandler.post(()->handleGestureEvent(event));
+                        }
+                    }
+
+                    @Override
+                    public void onError(RuntimeException error) {
+                        Log.e(TAG,"Gesture classifier failed"+error);
+                    }
                 }
+        );
+    }
+    private void handleGestureEvent(GestureEvent event){
+        Log.i(TAG,"Handling gesture event=" + event + " roleState=" + roleState);
+        if(event.getKind() == GestureEvent.Kind.GRAB){
+            Log.i(TAG,"Stable OPEN -> CLOSED transition: starting sender role");
+            startSenderMode();
+            return;
+        }
+        if(event.getKind() == GestureEvent.Kind.RELEASE){
+            Log.i(TAG,"Stable CLOSED -> OPEN transition: starting receiver role");
+            startRecieverMode();
+            return;
+        }
+
+    }
+
+    private void startSenderMode(){
+        if(roleState != RoleState.IDLE){
+            Log.w(TAG,"roleState is not idle");
+            return;
+        }
+        if(mediaProjection == null || imageReader == null){
+            Log.w(TAG,"mediaprojection or imageReader is null");
+            showStatus("Screen capture is not active");
+            return;
+        }
+
+        roleState = RoleState.SENDER_WAITING;
+        pendingItemUri = null;
+        pendingReciever = null;
+
+        mainHandler.removeCallbacks(senderTimeout);
+        mainHandler.postDelayed(senderTimeout,SENDER_TIMEOUT_MS);
+
+        if (!requestScreenCapture()) {
+            roleState = RoleState.IDLE;
+            mainHandler.removeCallbacks(senderTimeout);
+            showStatus("Could not start screen capture.");
+            return;
+        }
+
+        nsdTransferDiscovery.startDiscovery();
+
+        showStatus("Finding reciever and gallery matching started");
+    }
+
+    private void startRecieverMode(){
+        if(roleState != RoleState.IDLE){
+            Log.w(TAG, "Ignoring RELEASE because transfer role is already active: "
+                    + roleState);
+            return;
+        }
+        roleState = RoleState.RECIEVER_STARTING;
+        showStatus("starting reciever");
+        mainHandler.removeCallbacks(receiverStartupTimeout);
+        mainHandler.postDelayed(receiverStartupTimeout, RECIEVER_TIMEOUT_MS);
+
+        File temporaryDirectory = new File(getCacheDir(),"recieved-parts");
+
+        recieverServer = new TransferWebSocketServer(getApplicationContext(),
+                RECIEVER_PORT,
+                temporaryDirectory.toPath());
+
+        recieverServer.setServerStartedListener(()->{
+            mainHandler.post(()->{
+                if(roleState != RoleState.RECIEVER_STARTING){
+                    return;
+                }
+
+                mainHandler.removeCallbacks(receiverStartupTimeout);
+                roleState = RoleState.RECIEVER_LISTENING;
+                nsdTransferDiscovery.startAdvertising(Build.MODEL,RECIEVER_PORT);
+
+                showStatus("Reciever is ready");
+                Log.i(TAG,"Reciever listening and advertised on port " + RECIEVER_PORT);
             });
-        } catch (Exception e) {
-            Log.e(TAG, "connectWebSocket failed", e);
+        });
+
+        try{
+            recieverServer.start();
+        } catch(Exception e){
+            Log.e(TAG,"Could not start websocket server"+e);
+            stopRecieverMode();
+            showStatus("Could not start reciever");
         }
     }
 
     @Override
     public int onStartCommand(Intent intent,int flags,int startId){
+        super.onStartCommand(intent,flags,startId);
         if(intent==null){
             Log.d(TAG,"Service started without intent");
             stopSelf();
@@ -190,13 +404,8 @@ public class AirTransferService extends Service {
         }
 
         startForegroundForeground();
-
-        String peerHost = intent.getStringExtra(SenderDiscoveryActivity.EXTRA_PEER_HOST);
-        int peerPort = intent.getIntExtra(SenderDiscoveryActivity.EXTRA_PEER_PORT, 8080);
-
-        if(webSocketClient == null){
-            connectWebSocket(peerHost,peerPort);
-        }
+        initializeHandGestureClassifier();
+        startGestureCamera();
 
         startProjection(resultCode,resultData);
         return START_NOT_STICKY;
@@ -215,7 +424,8 @@ public class AirTransferService extends Service {
 
         Notification notification = createNotification(stopPendingIntent);
         if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q){
-            startForeground(NOTIFICATION_ID,notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+            int serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
+            startForeground(NOTIFICATION_ID,notification, serviceType);
         }
         else{
             startForeground(NOTIFICATION_ID,notification);
@@ -308,7 +518,7 @@ public class AirTransferService extends Service {
         background.setCornerRadius(1000f);
 
         bubble.setBackground(background);
-        bubble.setOnClickListener(view->onFloatingButtonTapped());
+        bubble.setOnClickListener(view->startSenderMode());
 
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -326,14 +536,13 @@ public class AirTransferService extends Service {
         bubbleAdded = true;
     }
 
-    private void onFloatingButtonTapped(){
+    private boolean requestScreenCapture(){
         if(mediaProjection == null || imageReader == null){
-            Toast.makeText(this,"Screen capture is not active",Toast.LENGTH_SHORT).show();
-            return;
+            return false;
         }
 
         if(capturePending.get()){
-            return;
+            return false;
         }
 
         if(bubble!=null){
@@ -341,6 +550,7 @@ public class AirTransferService extends Service {
         }
         frameToSkip.set(1);
         capturePending.set(true);
+        return true;
     }
 
     private void onImageAvailable(ImageReader reader){
@@ -370,19 +580,16 @@ public class AirTransferService extends Service {
             bitmap = imageToBitmap(image);
 
             if(bitmap == null){
-                Log.i(TAG,"Error in convertung from image to bitmap");
+                Log.i(TAG,"Error in converting from image to bitmap");
+                mainHandler.post(() ->
+                        finishSenderAttempt("Could not convert screen capture."));
                 return;
             }
 
-//            try{
-//                Uri dumpImageUri = BitmapDumpUtil.dumpBitmap(getApplicationContext(),
-//                        bitmap,"AirTransfer","Screen");
-//                Log.i(TAG,"ScreenShot saved to"+dumpImageUri);
-//            } catch(IOException e){
-//                Log.e(TAG,"Could not save the image"+e);
-//            }
-
             Bitmap bitmapForMatching = bitmap.copy(Bitmap.Config.ARGB_8888,false);
+            if (bitmapForMatching == null) {
+                throw new IllegalStateException("Could not copy captured bitmap for matching.");
+            }
             galleryMatchExecutor.execute(()->{
                 try{
                     GalleryImageMatcher.MatchResult matchResult = GalleryImageMatcher.findBestMatch(
@@ -393,10 +600,8 @@ public class AirTransferService extends Service {
                         Log.i(TAG,"No matching candidate was found. Images checked:"+
                                 matchResult.galleryImagesChecked);
 
-                        mainHandler.post(()->{
-                            Toast.makeText(getApplicationContext(),"No images match found",Toast.LENGTH_SHORT)
-                                    .show();
-                        });
+                        mainHandler.post(() ->
+                                finishSenderAttempt("No gallery image match was found."));
                         return;
                     }
 
@@ -411,32 +616,17 @@ public class AirTransferService extends Service {
                     mainHandler.post(()->{
                         Toast.makeText(getApplicationContext(),message,Toast.LENGTH_SHORT).show();
                     });
-                    if(matchResult.Confident) {
-                        try {
-                            Uri matchedUri = BitmapDumpUtil.copyImageToPictures(getApplicationContext(),
-                                    matchResult.bestUri, "AirTransfer");
-                            Log.i(TAG, "Matched image copied to gallery" + matchedUri);
-                        } catch (IOException e) {
-                            Log.e(TAG, "Could not copy matched image");
-                        }
-
-                        TransferWebSocketClient client = webSocketClient;
-                        TransferFileSender sender = fileSender;
-                        if(client == null || sender==null){
-                            Log.e(TAG,"Cannot send, laptop websocket server is not connected");
-                            mainHandler.post(()->{
-                                Toast.makeText(getApplicationContext(),"Server is not connected",Toast.LENGTH_SHORT).show();
-                            });
-                        }
-                        else{
-                            Log.i(TAG,"Image before being sent over websocket" + matchResult.bestDisplayName);
-                            sender.sendFile(getContentResolver(),matchResult.bestUri);
-                            Log.i(TAG,"Image sent over websocket" + matchResult.bestDisplayName);
-                        }
+                    if(!matchResult.Confident) {
+                        mainHandler.post(() ->
+                                finishSenderAttempt("No confident gallery match was found."));
+                        return;
                     }
-                    // If we have a confident match, send the original file from gallery
-                }catch(RuntimeException e){
-                    Log.e(TAG,"Gallery matching failed"+e);
+                    Uri matchedUri = matchResult.bestUri;
+                    mainHandler.post(()->onGalleryMatchReady(matchedUri));
+                }catch(Exception e){
+                    Log.e(TAG,"Gallery matching failed",e);
+                    mainHandler.post(() ->
+                            finishSenderAttempt("Gallery matching failed."));
                 } finally{
                     if(bitmapForMatching!=null && !bitmapForMatching.isRecycled()){
                         bitmapForMatching.recycle();
@@ -444,13 +634,12 @@ public class AirTransferService extends Service {
                 }
             });
 
-           // saveCapturedBitmap(bitmap);
             bitmap = null;
             mainHandler.post(()->{
                 if(bubble!=null) {
                     bubble.setVisibility(TextView.VISIBLE);
                 }
-                Toast.makeText(this,"Screen Image saved",Toast.LENGTH_SHORT).show();
+                Toast.makeText(this,"Screen captured; matching Gallery image.",Toast.LENGTH_SHORT).show();
             });
         } catch(Exception e){
             Log.e(TAG,"Could not captrue and save image",e);
@@ -461,7 +650,7 @@ public class AirTransferService extends Service {
                 if(bubble!=null) {
                     bubble.setVisibility(TextView.VISIBLE);
                 }
-                Toast.makeText(this,"Screen Image failed",Toast.LENGTH_SHORT).show();
+                finishSenderAttempt("Screen capture failed.");
             });
         } finally{
             if(bitmap!=null && !bitmap.isRecycled()){
@@ -471,6 +660,126 @@ public class AirTransferService extends Service {
                 image.close();
             }
         }
+    }
+
+    private void onGalleryMatchReady(Uri matchedUri){
+        if(roleState != RoleState.SENDER_WAITING){
+            Log.i(TAG,"sender session may have timed out while gallery matching");
+            return;
+        }
+
+        if(matchedUri == null){
+            finishSenderAttempt("matched uri is null");
+            return;
+        }
+
+        pendingItemUri = matchedUri;
+
+        Log.i(TAG,"Gallery image macthed and ready for transfer");
+        maybeConnectToReciever();
+    }
+
+    private void maybeConnectToReciever(){
+        if(roleState != RoleState.SENDER_WAITING || pendingItemUri == null ||
+                pendingReciever == null){
+            return;
+        }
+        nsdTransferDiscovery.stopDiscovery();
+
+        roleState = RoleState.SENDER_CONNECTING;
+        connectToReciever(pendingReciever);
+    }
+
+    private void connectToReciever(NSDTransferDiscovery.Peer recieverPeer){
+        try{
+            URI uri = new URI("ws://" + recieverPeer.hostAddress + ":" + recieverPeer.port);
+            Log.i(TAG,"Connectiong to discovered peer:"+uri);
+            webSocketClient = new TransferWebSocketClient(uri,
+                    new TransferWebSocketClient.Listener() {
+                        @Override
+                        public void onConnected() {
+                            Log.i(TAG,"Connected to reciever");
+                            mainHandler.post(()->sendPendingImage());
+                        }
+
+                        @Override
+                        public void onDisconnected() {
+                            Log.i(TAG,"Disocnnected from recievr");
+
+                            mainHandler.post(()->{
+                                if(roleState == RoleState.SENDER_CONNECTING ||
+                                        roleState == RoleState.SENDER_SENDING){
+                                    finishSenderAttempt("Connection to reciever was lost");
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void onError(Exception e) {
+                            Log.e(TAG,"reciever connection error"+e);
+                            mainHandler.post(()->{
+                                if(roleState == RoleState.SENDER_CONNECTING ||
+                                        roleState == RoleState.SENDER_SENDING){
+                                    finishSenderAttempt("Error connecting to reciever");
+                                }
+                            });
+
+                        }
+
+                        @Override
+                        public void onTextMessage(String message) {
+                            TransferFileSender sender = fileSender;
+                            if(sender != null){
+                                sender.onTextMessage(message);
+                            }
+                            Log.i(TAG,"Websocket reply");
+                        }
+                    });
+
+            fileSender = new TransferFileSender(webSocketClient);
+            wsExecutor.execute(()->{
+                try{
+                    webSocketClient.connect();
+                } catch(Exception e){
+                    Log.e(TAG,"websocket connection failed"+e);
+                    mainHandler.post(()->{
+                        finishSenderAttempt("Could not connect to reciever");
+                    });
+                }
+            });
+        } catch(Exception e){
+            Log.e(TAG,"Invalid reciever address");
+            finishSenderAttempt("Invalid reciever address");
+        }
+    }
+
+    private void sendPendingImage(){
+        if (roleState != RoleState.SENDER_CONNECTING) {
+            return;
+        }
+        if(pendingItemUri == null || pendingReciever == null || fileSender == null){
+            finishSenderAttempt("Sender was not ready after connection");
+            return;
+        }
+        mainHandler.removeCallbacks(senderTimeout);
+        roleState = RoleState.SENDER_SENDING;
+        Uri uritosend = pendingItemUri;
+        fileSender.sendFile(getContentResolver(), uritosend,
+                new TransferFileSender.TransferCallback() {
+                    @Override
+                    public void onSuccess() {
+                        mainHandler.post(() ->
+                                finishSenderAttempt("Image transfer completed."));
+                    }
+
+                    @Override
+                    public void onFailure(Exception error) {
+                        Log.e(TAG, "Image transfer failed", error);
+                        mainHandler.post(() ->
+                                finishSenderAttempt("Image transfer failed."));
+                    }
+                });
+
     }
 
     private Bitmap imageToBitmap(Image image){
@@ -556,18 +865,29 @@ public class AirTransferService extends Service {
             captureThread = null;
             captureHandler = null;
         }
+        if(cameraProvider != null && imageAnalysis != null){
+            cameraProvider.unbind(imageAnalysis);
+        }
+
+        if(cameraExecutor != null){
+            cameraExecutor.shutdown();
+        }
+
+        if(handGestureClassifier != null){
+            handGestureClassifier.cleanup();
+            handGestureClassifier = null;
+        }
     }
 
     @Override
     public void onDestroy(){
+        releaseNetworkResources();
+        galleryMatchExecutor.shutdownNow();
+        wsExecutor.shutdownNow();
         releaseCaptureResources(true);
         super.onDestroy();
-    }
 
-    @Nullable
-    @Override
-    public IBinder onBind(Intent intent){
-        return null;
+
     }
 
     private void createNotificationChannel(){
@@ -588,11 +908,104 @@ public class AirTransferService extends Service {
         return new NotificationCompat.Builder(this,CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_menu_camera)
                 .setContentTitle("Air transfer screen capture")
-                .setContentText("Capturing screeen image shortly")
+                .setContentText("Gesture transfer is active")
                 .setOngoing(true)
                 .addAction(android.R.drawable.ic_menu_close_clear_cancel,
                         "Stop",
                         stopPendingIntent)
                 .build();
+    }
+
+    private void finishSenderAttempt(String message){
+        if (roleState == RoleState.IDLE) {
+            return;
+        }
+        mainHandler.removeCallbacks(senderTimeout);
+        capturePending.set(false);
+        frameToSkip.set(0);
+        if (bubble != null) {
+            bubble.setVisibility(TextView.VISIBLE);
+        }
+        if(nsdTransferDiscovery!=null){
+            nsdTransferDiscovery.stopDiscovery();
+        }
+
+        if(fileSender!=null){
+            fileSender.shutdown();
+            fileSender = null;
+        }
+
+        if(webSocketClient != null){
+            try{
+                webSocketClient.close();
+            } catch(Exception e){
+                Log.e(TAG,"Error closing websocket client"+e);
+            }
+            webSocketClient = null;
+        }
+        pendingReciever = null;
+        pendingItemUri = null;
+        roleState = RoleState.IDLE;
+        showStatus(message);
+    }
+
+    private void stopRecieverMode() {
+        mainHandler.removeCallbacks(receiverStartupTimeout);
+        if (nsdTransferDiscovery != null) {
+            nsdTransferDiscovery.stopAll();
+        }
+        if (recieverServer != null) {
+            try {
+                recieverServer.stop(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                Log.e(TAG, "Error stopping recieverServer");
+            } catch (RuntimeException e) {
+                Log.e(TAG, "Error stopping recieverServer", e);
+            }
+            recieverServer = null;
+        }
+
+        if (roleState == RoleState.RECIEVER_STARTING || roleState == RoleState.RECIEVER_LISTENING) {
+            roleState = RoleState.IDLE;
+        }
+
+    }
+
+    private void releaseNetworkResources() {
+        mainHandler.removeCallbacks(senderTimeout);
+        mainHandler.removeCallbacks(receiverStartupTimeout);
+        capturePending.set(false);
+        roleState = RoleState.IDLE;
+        pendingItemUri = null;
+        pendingReciever = null;
+        if (nsdTransferDiscovery != null) {
+            nsdTransferDiscovery.stopAll();
+        }
+        if (recieverServer != null) {
+            try {
+                recieverServer.stop(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                Log.w(TAG, "Interrupted while stopping receiver server.", e);
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Could not stop receiver server cleanly.", e);
+            }
+            recieverServer = null;
+        }
+        if (fileSender != null) {
+            fileSender.shutdown();
+            fileSender = null;
+        }
+        if (webSocketClient != null) {
+            webSocketClient.close();
+            webSocketClient = null;
+        }
+    }
+
+    private void showStatus(String message){
+        Log.i(TAG,message);
+        mainHandler.post(()->Toast.makeText(getApplicationContext(),message,Toast.LENGTH_SHORT).show());
+
     }
 }

@@ -14,28 +14,21 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 
 
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
-import android.content.pm.PackageManager;
-import android.media.MediaScannerConnection;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.webkit.MimeTypeMap;
 
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.file.StandardCopyOption;
 
 
 
 public class TransferWebSocketServer extends WebSocketServer{
-    private WebSocket connectClient;
     private static String TAG = "TransferWebSocketServer";
     private static final long MAX_FILE_SIZE = 2L * 1024 * 1024 * 1024;
 
@@ -62,7 +55,6 @@ public class TransferWebSocketServer extends WebSocketServer{
 
     @Override
     public void onOpen(WebSocket conn,ClientHandshake handshake){
-        connectClient = conn;
         Log.i(TAG,"Websocket client connected"+conn.getRemoteSocketAddress());
     }
 
@@ -119,7 +111,7 @@ public class TransferWebSocketServer extends WebSocketServer{
             chunkFileSize += data.length;
 
             String replyClient = TransferProtocol.START_OK + "|" + chunkTransferId + "|" + chunkIndex;
-            sendMessage(replyClient);
+            conn.send(replyClient);
 
             chunkIndex++;
 
@@ -127,15 +119,13 @@ public class TransferWebSocketServer extends WebSocketServer{
 
         } catch(IOException e){
             Log.e(TAG,"Error in saaving buffers recieved",e);
+            conn.send(TransferProtocol.ERROR + "|" + e.getMessage());
             abortTransfer();
         }
     }
 
     @Override
     public void onClose(WebSocket conn,int code,String reason,boolean remote){
-        if(connectClient == conn){
-            connectClient=null;
-        }
         Log.i(TAG,"websocket disconnected");
         abortTransfer();
     }
@@ -157,11 +147,6 @@ public class TransferWebSocketServer extends WebSocketServer{
 
     public void setServerStartedListener(Runnable listener){
         this.serverStartedListener = listener;
-    }
-    public void sendMessage(String message){
-        if(connectClient!=null && connectClient.isOpen()){
-            connectClient.send(message);
-        }
     }
     private void handleStartMessage(WebSocket conn,String[] parts) throws IOException{
         try{
@@ -209,10 +194,11 @@ public class TransferWebSocketServer extends WebSocketServer{
                     decodedName + "of size:"+fileSize);
 
             String reply = TransferProtocol.START_OK + "|" + transferId;
-            sendMessage(reply);
+            conn.send(reply);
         } catch(IOException e){
             Log.e(TAG,"Error in handong start message",e);
             abortTransfer();
+            conn.send(TransferProtocol.ERROR + "|" + e.getMessage());
         }
     }
 
@@ -242,12 +228,13 @@ public class TransferWebSocketServer extends WebSocketServer{
             Uri finalImageUri = publishImageToPictures(chunkFile,finalFile.getFileName().toString());
             Files.deleteIfExists(chunkFile);
             Log.i(TAG,"Transfer completed" + chunkTransferId +
-                    "to file:"+ finalFile + "of size:" + finalSize);
+                    "to gallery uri:"+ finalImageUri + "of size:" + finalSize);
 
             String endMessage = TransferProtocol.DONE + "|" + chunkTransferId + "|" + chunkFileSize;
-            sendMessage(endMessage);
+            conn.send(endMessage);
         } catch(IOException e){
             Log.e(TAG,"error occured in handleEndMessage"+e);
+            conn.send(TransferProtocol.ERROR + "|" + e.getMessage());
         } finally {
             abortTransfer();
         }
@@ -283,7 +270,7 @@ public class TransferWebSocketServer extends WebSocketServer{
             extension = displayName.substring(dot+1).toLowerCase();
         }
 
-        String mimeType = MimeTypeMap.getSingleton().getExtensionFromMimeType(extension);
+        String mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension);
 
         if(mimeType == null || !mimeType.startsWith("image/")){
             mimeType = "image/jpeg";
@@ -291,7 +278,7 @@ public class TransferWebSocketServer extends WebSocketServer{
 
         ContentResolver resolver = appContext.getContentResolver();
         ContentValues values = new ContentValues();
-        values.put(MediaStore.Images.Media.RELATIVE_PATH,displayName);
+        values.put(MediaStore.Images.Media.DISPLAY_NAME,displayName);
         values.put(MediaStore.Images.Media.MIME_TYPE,mimeType);
         values.put(MediaStore.Images.Media.RELATIVE_PATH,
                 Environment.DIRECTORY_PICTURES+"/AirTransferReciever");

@@ -93,13 +93,17 @@ public class NSDTransferDiscovery {
             public void onRegistrationFailed(NsdServiceInfo nsdServiceInfo, int i) {
                 serviceRegistered = false;
                 advertisingRequested = false;
-                postStatus("registration advertisement failed");
+                postError("Registration advertisement failed", i);
             }
 
             @Override
             public void onServiceRegistered(NsdServiceInfo nsdServiceInfo) {
                 serviceRegistered = true;
                 registeredServiceName = nsdServiceInfo.getServiceName();
+
+                Log.i(TAG, "NSD_ADVERTISED name=" + registeredServiceName
+                        + " type=" + nsdServiceInfo.getServiceType()
+                        + " port=" + nsdServiceInfo.getPort());
 
                 postStatus("registration advertisement done. Disocverable as "+registeredServiceName);
                 if(!advertisingRequested){
@@ -166,6 +170,10 @@ public class NSDTransferDiscovery {
                     Log.i(TAG,"discovered service has already been added to resolvingNames");
                     return;
                 }
+
+                Log.i(TAG, "NSD_ADVERTISED name=" + nsdServiceInfo.getServiceName()
+                        + " type=" + nsdServiceInfo.getServiceType()
+                        + " port=" + nsdServiceInfo.getPort());
 
                 Log.i(TAG,"Service found");
                 postStatus("Found recievers, getting the addresses..");
@@ -236,6 +244,11 @@ public class NSDTransferDiscovery {
                             Log.w(TAG,"Resolved service has invalid host or port");
                             return;
                         }
+
+                        Log.i(TAG, "NSD_RESOLVED name=" + name
+                                + " address=" + host.getHostAddress()
+                                + " port=" + port);
+
                         Peer peer = new Peer(name,host.getHostAddress(),port);
                         resolvedPeers.put(name,peer);
                         Log.i(TAG,"Peer found");

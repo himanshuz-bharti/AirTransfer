@@ -85,6 +85,8 @@ dependencies {
         implementation("androidx.camera:camera-view:$cameraxVersion")
         implementation("com.google.mediapipe:tasks-vision:0.10.29")
 
+        implementation("androidx.lifecycle:lifecycle-service:2.11.0")
+
         implementation("com.google.ai.edge.litert:litert:1.4.0")
         implementation("com.google.android.material:material:1.11.0")
 

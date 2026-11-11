@@ -10,6 +10,8 @@
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED"/>
 
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"/>
+
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32"/>
     
@@ -36,10 +38,10 @@
         <service
             android:name=".Transfer.AirTransferService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection"
+            android:foregroundServiceType="camera|mediaProjection"
             />
         <activity
-            android:name=".RoleChooserActivity"
+            android:name=".MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -47,20 +49,6 @@
             </intent-filter>
         </activity>
 
-        <activity
-            android:name=".SenderDiscoveryActivity"
-            android:exported="false">
-        </activity>
-
-        <activity
-            android:name=".MainActivity"
-            android:exported="false">
-        </activity>
-
-        <activity
-            android:name=".ReceiverActivity"
-            android:exported="false">
-        </activity>
     </application>
 
 </manifest>

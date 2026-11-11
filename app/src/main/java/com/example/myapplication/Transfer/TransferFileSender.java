@@ -1,7 +1,6 @@
 package com.example.myapplication.Transfer;
 
 import android.content.ContentResolver;
-import android.content.ContentResolver;
 import android.database.Cursor;
 import android.net.Uri;
 import android.provider.OpenableColumns;
@@ -14,7 +13,6 @@ import org.java_websocket.client.WebSocketClient;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
-import java.sql.Time;
 import java.util.Base64;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -32,8 +30,11 @@ public class TransferFileSender {
     private final BlockingQueue<String> replies = new LinkedBlockingQueue<>();
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
-    private volatile boolean connected ;
-    private @Nullable String currentTransferId;
+
+    public interface TransferCallback{
+        void onSuccess();
+        void onFailure(Exception e);
+    }
 
     public TransferFileSender(@Nullable TransferWebSocketClient  webSocketClient){
         if(webSocketClient == null){
@@ -44,6 +45,10 @@ public class TransferFileSender {
     }
 
     public void sendFile(ContentResolver resolver, Uri uri){
+        sendFile(resolver,uri,null);
+
+    }
+    public void sendFile(ContentResolver resolver, Uri uri, @Nullable TransferCallback callback){
         if(resolver == null  || uri == null){
             throw new IllegalArgumentException("resolver or uri is null");
         }
@@ -53,8 +58,14 @@ public class TransferFileSender {
         executor.execute(()->{
             try{
                 doSendFile(resolver,uri);
+                if(callback != null){
+                    callback.onSuccess();
+                }
             }catch(Exception e){
-                e.printStackTrace();
+                Log.e(TAG, "File transfer failed", e);
+                if(callback != null){
+                    callback.onFailure(e);
+                }
             }
         });
     }
@@ -75,18 +86,7 @@ public class TransferFileSender {
         }
 
         String transferId = TransferFileMetadata.newtransferId();
-        currentTransferId = transferId;
-        connected = true;
-
-        try{
-            Log.i(TAG,"before startransfer");
-            startTransfer(resolver,uri,filename,fileSize,transferId);
-        } catch(Exception e){
-            Log.e(TAG,"Error in sending fire through websockets",e);
-        } finally{
-            connected = false;
-            currentTransferId = null;
-        }
+        startTransfer(resolver,uri,filename,fileSize,transferId);
     }
 
     private void startTransfer(ContentResolver resolver, Uri uri, String filename,Long fileSize,String transferId)
@@ -203,5 +203,8 @@ public class TransferFileSender {
         if(message != null){
             replies.offer(message);
         }
+    }
+    public void shutdown(){
+        executor.shutdownNow();
     }
 }
