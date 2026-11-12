@@ -46,6 +46,7 @@ public class TransferWebSocketServer extends WebSocketServer{
     private Path chunkFile;
 
     private Runnable serverStartedListener;
+    private Runnable transferCompletedListener;
 
     public TransferWebSocketServer(Context appContext,int port, Path recieveDirectory){
         super(new InetSocketAddress(port));
@@ -145,6 +146,10 @@ public class TransferWebSocketServer extends WebSocketServer{
         }
     }
 
+    public void setTransferCompletedListener(Runnable listener){
+        this.transferCompletedListener = listener;
+    }
+
     public void setServerStartedListener(Runnable listener){
         this.serverStartedListener = listener;
     }
@@ -232,6 +237,10 @@ public class TransferWebSocketServer extends WebSocketServer{
 
             String endMessage = TransferProtocol.DONE + "|" + chunkTransferId + "|" + chunkFileSize;
             conn.send(endMessage);
+
+            if(transferCompletedListener != null){
+                transferCompletedListener.run();
+            }
         } catch(IOException e){
             Log.e(TAG,"error occured in handleEndMessage"+e);
             conn.send(TransferProtocol.ERROR + "|" + e.getMessage());

@@ -18,7 +18,10 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class NSDTransferDiscovery {
     private static final String TAG = "NSDTransferDiscovery";
-    public static final String SERVICE_TYPE = "_airtransfer._tcp.";
+    public static final String RECIEVER_SERVICE_TYPE = "_airtransfer._tcp.";
+    public static final String OFFER_SERVICE_TYPE = "_airoffer._tcp.";
+
+    private final String serviceType;
 
     public interface Listener{
         void onStatus(String message);
@@ -31,16 +34,18 @@ public class NSDTransferDiscovery {
         public final String serviceName;
         public final String hostAddress;
         public final int port;
+        public final String sessionId;
 
-        public Peer(String serviceName,String hostAddress,int port){
+        public Peer(String serviceName,String hostAddress,int port,String sessionId){
             this.serviceName = serviceName;
             this.hostAddress = hostAddress;
             this.port = port;
+            this.sessionId = sessionId;
         }
 
         @Override
         public String toString(){
-            return serviceName + "(" + hostAddress + ":" + port +")";
+            return serviceName + "(" + hostAddress + ":" + port + ":" + sessionId +")" ;
         }
     }
 
@@ -61,18 +66,23 @@ public class NSDTransferDiscovery {
 
     private WifiManager.MulticastLock multicastLock;
 
-    public NSDTransferDiscovery(Context context,Listener listener){
+    public NSDTransferDiscovery(Context context, String serviceType, Listener listener){
         this.appContext = context.getApplicationContext();
         this.nsdManager = (NsdManager) appContext.getSystemService(Context.NSD_SERVICE);
         this.listener = listener;
+        this.serviceType = serviceType;
         if(nsdManager == null){
             throw new IllegalStateException("Android NSD service is not available");
         }
     }
 
-    public void startAdvertising(String deviceName,int port){
+    public void startAdvertising(String deviceName,int port,String sessionId){
         if(advertisingRequested){
             Log.e(TAG,"An advertising is already requested");
+            return;
+        }
+        if(sessionId==null || sessionId.isEmpty()){
+            Log.e(TAG,"Cannpt advertise without a sessionId");
             return;
         }
         if(port<1 || port>65535){
@@ -81,11 +91,13 @@ public class NSDTransferDiscovery {
         }
         advertisingRequested = true;
         String safeName = sanitizeName(deviceName);
-        String requestedServiceName = "Airtransfer-"+safeName;
+        String shortSessionId = sessionId.substring(0, Math.min(8,sessionId.length()));
+        String requestedServiceName = "Airtransfer-" +safeName + shortSessionId;
 
         NsdServiceInfo serviceInfo = new NsdServiceInfo();
         serviceInfo.setServiceName(requestedServiceName);
-        serviceInfo.setServiceType(SERVICE_TYPE);
+        serviceInfo.setServiceType(serviceType);
+        serviceInfo.setAttribute("sid",sessionId);
         serviceInfo.setPort(port);
 
         registrationListener = new NsdManager.RegistrationListener() {
@@ -156,7 +168,7 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onServiceFound(NsdServiceInfo nsdServiceInfo) {
-                if(!SERVICE_TYPE.equalsIgnoreCase(nsdServiceInfo.getServiceType())){
+                if(!serviceType.equalsIgnoreCase(nsdServiceInfo.getServiceType())){
                     Log.i(TAG,"the discovered service type is different than the expected service type");
                     return;
                 }
@@ -215,7 +227,7 @@ public class NSDTransferDiscovery {
 
         discoveryListener = newListener;
 
-        nsdManager.discoverServices(SERVICE_TYPE,NsdManager.PROTOCOL_DNS_SD,discoveryListener);
+        nsdManager.discoverServices(serviceType,NsdManager.PROTOCOL_DNS_SD,discoveryListener);
     }
 
     @SuppressWarnings("deprecation")
@@ -232,8 +244,12 @@ public class NSDTransferDiscovery {
                     public void onServiceResolved(NsdServiceInfo nsdServiceInfo) {
                         String name = nsdServiceInfo.getServiceName();
                         resolvingNames.remove(name);
+                        byte[] sidBytes = nsdServiceInfo.getAttributes().get("sid");
 
-                        if(discoveryListener == null || name == null){
+                        String sessionId = sidBytes ==  null? null :
+                                new String(sidBytes,StandardCharsets.UTF_8);
+
+                        if(discoveryListener == null || name == null || sessionId == null){
                             return;
                         }
 
@@ -249,7 +265,7 @@ public class NSDTransferDiscovery {
                                 + " address=" + host.getHostAddress()
                                 + " port=" + port);
 
-                        Peer peer = new Peer(name,host.getHostAddress(),port);
+                        Peer peer = new Peer(name,host.getHostAddress(),port,sessionId);
                         resolvedPeers.put(name,peer);
                         Log.i(TAG,"Peer found");
                         postPeerFound(peer);

@@ -33,6 +33,9 @@ import android.widget.Toast;
 
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -70,10 +73,21 @@ public class AirTransferService extends LifecycleService {
 
     private static final int RECIEVER_PORT = 8080;
     private static final long SENDER_TIMEOUT_MS = 60000L;
-    private static final long RECIEVER_TIMEOUT_MS = 10000L;
+    private static final long RECIEVER_TIMEOUT_MS = 60000L;
+    private static final long RECIEVER_SESSION_TIMEOUT_MS = 60000L;
+
+    private Runnable recieverSessionTimeout;
 
     private RoleState roleState = RoleState.IDLE;
-    private NSDTransferDiscovery nsdTransferDiscovery;
+//    private NSDTransferDiscovery nsdTransferDiscovery;
+    private static final String OFFER_SERVICE_TYPE = NSDTransferDiscovery.OFFER_SERVICE_TYPE;
+    private static final String RECIEVER_SERVICE_TYPE = NSDTransferDiscovery.RECIEVER_SERVICE_TYPE;
+
+    private NSDTransferDiscovery offerNsd;
+    private NSDTransferDiscovery recieverNsd;
+    private final Map<String,NSDTransferDiscovery.Peer> visibleSenderOffers = new HashMap<>();
+    private String activeSenderSessionId;
+    private String activeRecieverSessionId;
     private TransferWebSocketServer recieverServer;
     private NSDTransferDiscovery.Peer pendingReciever;
     private Uri pendingItemUri;
@@ -85,7 +99,7 @@ public class AirTransferService extends LifecycleService {
     };
     private final Runnable receiverStartupTimeout = () -> {
         if (roleState == RoleState.RECIEVER_STARTING) {
-            stopRecieverMode();
+            finishRecieverSession("Receiver server did not start.");
             showStatus("Receiver server did not start.");
         }
     };
@@ -209,18 +223,64 @@ public class AirTransferService extends LifecycleService {
     }
 
     private void initializeNSD(){
-        nsdTransferDiscovery = new NSDTransferDiscovery(
+        offerNsd = new NSDTransferDiscovery(
                 getApplicationContext(),
+                OFFER_SERVICE_TYPE,
                 new NSDTransferDiscovery.Listener() {
                     @Override
                     public void onStatus(String message) {
-                        Log.i(TAG,"NSD:"+message);
+                        Log.i(TAG,"Sender NSD:"+message);
                     }
 
                     @Override
                     public void onPeerFound(NSDTransferDiscovery.Peer peer) {
-                        Log.i(TAG, "NSD_PEER_CALLBACK role=" + roleState + " peer=" + peer);
+                        if(peer.sessionId == null || peer.sessionId.isEmpty()){
+                            Log.w(TAG,"Ignore peers without a sessionId");
+                            return;
+                        }
+                        visibleSenderOffers.put(peer.sessionId,peer);
+                        Log.i(TAG, "Sender offer detected role=");
+                    }
+
+                    @Override
+                    public void onPeerLost(NSDTransferDiscovery.Peer peer) {
+                        Log.i(TAG,"Sender offer lost");
+
+                        if(peer.sessionId!=null){
+                            visibleSenderOffers.remove(peer.sessionId);
+                        }
+
+                        if(peer.sessionId != null && peer.sessionId.equals(activeRecieverSessionId)
+                              && isRecieverState()){
+                            finishRecieverSession("Sender session ended");
+                        }
+                    }
+
+                    @Override
+                    public void onError(String message, int errorCode) {
+                        Log.e(TAG,"NSD error:"+message + ":code"+errorCode);
+                    }
+                }
+        );
+
+        recieverNsd = new NSDTransferDiscovery(
+                getApplicationContext(),
+                RECIEVER_SERVICE_TYPE,
+                new NSDTransferDiscovery.Listener() {
+                    @Override
+                    public void onStatus(String message) {
+                        Log.i(TAG,"Reciever Nsd"+message);
+                    }
+
+                    @Override
+                    public void onPeerFound(NSDTransferDiscovery.Peer peer) {
+                        Log.i(TAG,"Reciever discovered");
                         if(roleState != RoleState.SENDER_WAITING){
+                            return;
+                        }
+
+                        if(activeSenderSessionId == null || !peer.sessionId.equals(activeSenderSessionId)){
+                            Log.i(TAG,"Ignoring reciever with a different session ID");
                             return;
                         }
 
@@ -232,28 +292,33 @@ public class AirTransferService extends LifecycleService {
 
                     @Override
                     public void onPeerLost(NSDTransferDiscovery.Peer peer) {
-                        Log.i(TAG,"NSD reciever lost");
-
+                        Log.i(TAG,"Reciever service lost"+peer);
                         if(pendingReciever != null && pendingReciever.serviceName.equals(peer.serviceName)
-                                && roleState == RoleState.SENDER_WAITING){
+                             && roleState == RoleState.SENDER_WAITING){
                             pendingReciever = null;
                         }
+
                     }
 
                     @Override
                     public void onError(String message, int errorCode) {
-                        Log.e(TAG,"NSD error:"+message + ":code"+errorCode);
-                        if(roleState == RoleState.SENDER_WAITING){
-                            finishSenderAttempt(message);
-                        }
-                        else if(roleState == RoleState.RECIEVER_STARTING
-                                || roleState == RoleState.RECIEVER_LISTENING){
-                            stopRecieverMode();
-                            showStatus(message);
+                        Log.i(TAG,"Reciever NSD error"+message + ",code:"+errorCode);
+                        if(isSenderState()){
+                            finishSenderAttempt("Recieevr discovery failed");
                         }
                     }
                 }
         );
+
+        offerNsd.startDiscovery();
+    }
+
+    private boolean isSenderState(){
+        return roleState == RoleState.SENDER_WAITING || roleState == RoleState.SENDER_CONNECTING || roleState == RoleState.SENDER_SENDING;
+    }
+
+    private boolean isRecieverState(){
+        return roleState == RoleState.RECIEVER_STARTING || roleState == RoleState.RECIEVER_LISTENING;
     }
 
     private void initializeHandGestureClassifier(){
@@ -314,21 +379,22 @@ public class AirTransferService extends LifecycleService {
             return;
         }
 
+        activeSenderSessionId = UUID.randomUUID().toString();
+
         roleState = RoleState.SENDER_WAITING;
         pendingItemUri = null;
         pendingReciever = null;
 
         mainHandler.removeCallbacks(senderTimeout);
         mainHandler.postDelayed(senderTimeout,SENDER_TIMEOUT_MS);
-
-        if (!requestScreenCapture()) {
-            roleState = RoleState.IDLE;
-            mainHandler.removeCallbacks(senderTimeout);
-            showStatus("Could not start screen capture.");
+        if(!requestScreenCapture()){
+            finishSenderAttempt("Could not get screen capture");
             return;
         }
 
-        nsdTransferDiscovery.startDiscovery();
+        offerNsd.startAdvertising(Build.MODEL,RECIEVER_PORT,activeSenderSessionId);
+
+        recieverNsd.startDiscovery();
 
         showStatus("Finding reciever and gallery matching started");
     }
@@ -339,29 +405,54 @@ public class AirTransferService extends LifecycleService {
                     + roleState);
             return;
         }
+
+        if(visibleSenderOffers.isEmpty()){
+            showStatus("No sender offer detected. Do GRAB on sender first");
+            return;
+        }
+
+        if(visibleSenderOffers.size()>1){
+            showStatus("Multiple senders detected. Cancel them to proceed");
+            Log.i(TAG,"Ignoring release. Offers detected=" + visibleSenderOffers.keySet());
+            return;
+        }
+        NSDTransferDiscovery.Peer offer = visibleSenderOffers.values().iterator().next();
+        activeRecieverSessionId = offer.sessionId;
+        visibleSenderOffers.remove(activeRecieverSessionId);
+
         roleState = RoleState.RECIEVER_STARTING;
-        showStatus("starting reciever");
+        showStatus("starting reciever for the sesson" + activeRecieverSessionId);
+
         mainHandler.removeCallbacks(receiverStartupTimeout);
         mainHandler.postDelayed(receiverStartupTimeout, RECIEVER_TIMEOUT_MS);
 
         File temporaryDirectory = new File(getCacheDir(),"recieved-parts");
+        final String expectedSessionId = activeRecieverSessionId;
 
         recieverServer = new TransferWebSocketServer(getApplicationContext(),
                 RECIEVER_PORT,
                 temporaryDirectory.toPath());
 
+        recieverServer.setTransferCompletedListener(()->{
+            mainHandler.postDelayed(()->{
+                if(expectedSessionId.equals(activeRecieverSessionId) && roleState == RoleState.RECIEVER_LISTENING){
+                    finishRecieverSession("Image recieved successfully");
+                }
+            },1000L);
+        });
         recieverServer.setServerStartedListener(()->{
             mainHandler.post(()->{
-                if(roleState != RoleState.RECIEVER_STARTING){
+                if(roleState != RoleState.RECIEVER_STARTING || !expectedSessionId.equals(activeRecieverSessionId)){
                     return;
                 }
 
                 mainHandler.removeCallbacks(receiverStartupTimeout);
                 roleState = RoleState.RECIEVER_LISTENING;
-                nsdTransferDiscovery.startAdvertising(Build.MODEL,RECIEVER_PORT);
+                recieverNsd.startAdvertising(Build.MODEL,RECIEVER_PORT,expectedSessionId);
 
-                showStatus("Reciever is ready");
+                showStatus("Reciever is ready for sender session");
                 Log.i(TAG,"Reciever listening and advertised on port " + RECIEVER_PORT);
+                scheduleRecieverSessionTimeout(expectedSessionId);
             });
         });
 
@@ -369,10 +460,58 @@ public class AirTransferService extends LifecycleService {
             recieverServer.start();
         } catch(Exception e){
             Log.e(TAG,"Could not start websocket server"+e);
-            stopRecieverMode();
+            finishRecieverSession("Could not start reciever");
             showStatus("Could not start reciever");
         }
     }
+
+    private void scheduleRecieverSessionTimeout(String sessionId){
+        if(recieverSessionTimeout!=null){
+            mainHandler.removeCallbacks(recieverSessionTimeout);
+        }
+
+        recieverSessionTimeout = ()->{
+            if(sessionId.equals(activeRecieverSessionId) && roleState==RoleState.RECIEVER_LISTENING){
+                showStatus("Reciever timed out waiting for sender");
+                finishRecieverSession("Reciever timed out waiting for sender");
+            }
+        };
+
+        mainHandler.postDelayed(recieverSessionTimeout,RECIEVER_SESSION_TIMEOUT_MS);
+    }
+
+    private void finishRecieverSession(String message){
+        if(!isRecieverState()){
+            return;
+        }
+
+        mainHandler.removeCallbacks(receiverStartupTimeout);
+        if(recieverSessionTimeout!=null){
+            mainHandler.removeCallbacks(recieverSessionTimeout);
+            recieverSessionTimeout = null;
+        }
+
+        roleState = RoleState.IDLE;
+        if(recieverServer!=null){
+            try{
+                recieverServer.stop();
+            } catch(InterruptedException e){
+                Thread.currentThread().interrupt();
+                Log.w(TAG,"Interrupted while stopping recieevrServer");
+            } catch(RuntimeException e){
+                Log.w(TAG,"Error stopping recieverServer");
+            }
+
+            recieverServer = null;
+        }
+
+        if(recieverNsd != null){
+            recieverNsd.stopAdvertising();
+        }
+        activeRecieverSessionId = null;
+        showStatus(message);
+    }
+
 
     @Override
     public int onStartCommand(Intent intent,int flags,int startId){
@@ -681,10 +820,11 @@ public class AirTransferService extends LifecycleService {
 
     private void maybeConnectToReciever(){
         if(roleState != RoleState.SENDER_WAITING || pendingItemUri == null ||
-                pendingReciever == null){
+                pendingReciever == null || activeSenderSessionId == null ||
+                !activeSenderSessionId.equals(pendingReciever.sessionId)){
             return;
         }
-        nsdTransferDiscovery.stopDiscovery();
+        recieverNsd.stopDiscovery();
 
         roleState = RoleState.SENDER_CONNECTING;
         connectToReciever(pendingReciever);
@@ -915,17 +1055,18 @@ public class AirTransferService extends LifecycleService {
     }
 
     private void finishSenderAttempt(String message){
-        if (roleState == RoleState.IDLE) {
+        if(!isSenderState()){
             return;
         }
+
         mainHandler.removeCallbacks(senderTimeout);
         capturePending.set(false);
         frameToSkip.set(0);
+
+        offerNsd.stopAdvertising();
+        recieverNsd.stopDiscovery();
         if (bubble != null) {
             bubble.setVisibility(TextView.VISIBLE);
-        }
-        if(nsdTransferDiscovery!=null){
-            nsdTransferDiscovery.stopDiscovery();
         }
 
         if(fileSender!=null){
@@ -943,31 +1084,9 @@ public class AirTransferService extends LifecycleService {
         }
         pendingReciever = null;
         pendingItemUri = null;
+        activeSenderSessionId = null;
         roleState = RoleState.IDLE;
         showStatus(message);
-    }
-
-    private void stopRecieverMode() {
-        mainHandler.removeCallbacks(receiverStartupTimeout);
-        if (nsdTransferDiscovery != null) {
-            nsdTransferDiscovery.stopAll();
-        }
-        if (recieverServer != null) {
-            try {
-                recieverServer.stop(1000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                Log.e(TAG, "Error stopping recieverServer");
-            } catch (RuntimeException e) {
-                Log.e(TAG, "Error stopping recieverServer", e);
-            }
-            recieverServer = null;
-        }
-
-        if (roleState == RoleState.RECIEVER_STARTING || roleState == RoleState.RECIEVER_LISTENING) {
-            roleState = RoleState.IDLE;
-        }
-
     }
 
     private void releaseNetworkResources() {
@@ -977,8 +1096,11 @@ public class AirTransferService extends LifecycleService {
         roleState = RoleState.IDLE;
         pendingItemUri = null;
         pendingReciever = null;
-        if (nsdTransferDiscovery != null) {
-            nsdTransferDiscovery.stopAll();
+        if (offerNsd != null) {
+            offerNsd.stopAll();
+        }
+        if(recieverNsd != null){
+            recieverNsd.stopAll();
         }
         if (recieverServer != null) {
             try {
