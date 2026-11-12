@@ -291,12 +291,12 @@ public class AirTransferService extends LifecycleService {
     private void handleGestureEvent(GestureEvent event){
         Log.i(TAG,"Handling gesture event=" + event + " roleState=" + roleState);
         if(event.getKind() == GestureEvent.Kind.GRAB){
-            Log.i(TAG,"Stable OPEN -> CLOSED transition: starting sender role");
+            Log.i(TAG,"Closed fist recognized,starting senderFile");
             startSenderMode();
             return;
         }
         if(event.getKind() == GestureEvent.Kind.RELEASE){
-            Log.i(TAG,"Stable CLOSED -> OPEN transition: starting receiver role");
+            Log.i(TAG,"Closed fist recognized,starting senderFile");
             startRecieverMode();
             return;
         }
@@ -886,8 +886,6 @@ public class AirTransferService extends LifecycleService {
         wsExecutor.shutdownNow();
         releaseCaptureResources(true);
         super.onDestroy();
-
-
     }
 
     private void createNotificationChannel(){
