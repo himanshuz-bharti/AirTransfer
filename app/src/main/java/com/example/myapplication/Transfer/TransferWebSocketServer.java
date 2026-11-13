@@ -46,7 +46,11 @@ public class TransferWebSocketServer extends WebSocketServer{
     private Path chunkFile;
 
     private Runnable serverStartedListener;
-    private Runnable transferCompletedListener;
+    private TransferCompletedListener transferCompletedListener;
+
+    public interface TransferCompletedListener{
+        void onTransferCompleted(Uri uri,String mimeType,String diplayName);
+    }
 
     public TransferWebSocketServer(Context appContext,int port, Path recieveDirectory){
         super(new InetSocketAddress(port));
@@ -146,7 +150,7 @@ public class TransferWebSocketServer extends WebSocketServer{
         }
     }
 
-    public void setTransferCompletedListener(Runnable listener){
+    public void setTransferCompletedListener(TransferCompletedListener listener){
         this.transferCompletedListener = listener;
     }
 
@@ -230,17 +234,20 @@ public class TransferWebSocketServer extends WebSocketServer{
                 outputStream = null;
             }
 
-            Uri finalImageUri = publishImageToPictures(chunkFile,finalFile.getFileName().toString());
+            String displayName = finalFile.getFileName().toString();
+            Uri finalImageUri = publishImageToPictures(chunkFile,displayName);
             Files.deleteIfExists(chunkFile);
             Log.i(TAG,"Transfer completed" + chunkTransferId +
                     "to gallery uri:"+ finalImageUri + "of size:" + finalSize);
 
+            if(transferCompletedListener != null){
+                String mimeType = appContext.getContentResolver().getType(finalImageUri);
+                transferCompletedListener.onTransferCompleted(finalImageUri,
+                        mimeType==null?"image/*":mimeType,displayName);
+            }
+
             String endMessage = TransferProtocol.DONE + "|" + chunkTransferId + "|" + chunkFileSize;
             conn.send(endMessage);
-
-            if(transferCompletedListener != null){
-                transferCompletedListener.run();
-            }
         } catch(IOException e){
             Log.e(TAG,"error occured in handleEndMessage"+e);
             conn.send(TransferProtocol.ERROR + "|" + e.getMessage());

@@ -17,7 +17,7 @@ public class GestureDebouncer {
     private static final long VOTE_WINDOW_MS = 1400L;
     private static final long MIN_POSE_SPAN_MS = 250L;
     private static final long SHORT_HAND_GAP_RESET_MS = 300L;
-    private static final long HAND_ABSENT_TO_REARM_MS = 1200L;
+    private static final long HAND_ABSENT_TO_REARM_MS = 1000L;
 
     private static final int MIN_VALID_VOTES = 4;
     private static final float REQUIRED_VOTE_RATIO = 0.70f;

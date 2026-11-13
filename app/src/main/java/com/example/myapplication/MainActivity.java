@@ -46,7 +46,7 @@ public class MainActivity extends AppCompatActivity {
                         if (Settings.canDrawOverlays(this)) {
                             continueSetup();
                         } else {
-                            finishSetupWithMessage("Overlay permission is required for the transfer control.");
+                            finishSetupWithMessage("Overlay permission is required for the transfer animation.");
                         }
                     }
             );
@@ -121,7 +121,7 @@ public class MainActivity extends AppCompatActivity {
         }
 
         if (!Settings.canDrawOverlays(this)) {
-            statusText.setText("Allow the floating transfer control.");
+            statusText.setText("Allow the transfer animation overlay.");
             Intent intent = new Intent(
                     Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                     Uri.parse("package:" + getPackageName())
