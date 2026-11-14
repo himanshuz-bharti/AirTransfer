@@ -82,12 +82,10 @@ dependencies {
         implementation("androidx.camera:camera-core:$cameraxVersion")
         implementation("androidx.camera:camera-camera2:$cameraxVersion")
         implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
-        implementation("androidx.camera:camera-view:$cameraxVersion")
         implementation("com.google.mediapipe:tasks-vision:0.10.29")
 
         implementation("androidx.lifecycle:lifecycle-service:2.11.0")
 
-        implementation("com.google.ai.edge.litert:litert:1.4.0")
         implementation("com.google.android.material:material:1.11.0")
 
         implementation("org.java-websocket:Java-WebSocket:1.6.0")

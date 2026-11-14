@@ -1,8 +1,8 @@
 package com.example.myapplication;
 
-import android.Manifest;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.Manifest;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
 import android.os.Build;
@@ -34,7 +34,7 @@ public class MainActivity extends AppCompatActivity {
                         if (granted) {
                             continueSetup();
                         } else {
-                            finishSetupWithMessage("Camera permission is required for gesture detection.");
+                            finishSetupWithMessage("Camera permission is required for hand gestures.");
                         }
                     }
             );

@@ -8,7 +8,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
-import android.graphics.Matrix;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
@@ -36,23 +35,22 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import androidx.camera.core.CameraSelector;
-import androidx.camera.core.ImageAnalysis;
-import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.core.app.NotificationCompat;
 import androidx.core.content.ContextCompat;
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.ImageProxy;
+import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.lifecycle.LifecycleService;
 
-import com.example.myapplication.Gesture.GestureDebouncer;
-import com.example.myapplication.Gesture.GestureEvent;
-import com.example.myapplication.Gesture.GestureType;
 import com.example.myapplication.RecieveImageActivity;
+import com.example.myapplication.ui.GestureDebugOverlay;
 import com.example.myapplication.ui.TransferEffectOverlay;
-import com.example.myapplication.vision.HandGestureClassifier;
-import com.example.myapplication.camera.ImageConverter;
+import com.example.myapplication.vision.HandGestureController;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.mediapipe.framework.image.BitmapImageBuilder;
+import com.google.mediapipe.framework.image.MPImage;
+import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions;
 
 
 import java.io.File;
@@ -74,12 +72,13 @@ public class AirTransferService extends LifecycleService {
     private static final long SENDER_NO_RECEIVER_TIMEOUT_MS = 20000L;
     private static final long RECIEVER_TIMEOUT_MS = 60000L;
     private static final long RECIEVER_SESSION_TIMEOUT_MS = 60000L;
-
+    private static final long GESTURE_FRAME_INTERVAL_MS = 200L;
     private Runnable recieverSessionTimeout;
 
     private RoleState roleState = RoleState.IDLE;
 
     private TransferEffectOverlay transferEffectOverlay;
+    private GestureDebugOverlay gestureDebugOverlay;
     private static final String OFFER_SERVICE_TYPE = NSDTransferDiscovery.OFFER_SERVICE_TYPE;
     private static final String RECIEVER_SERVICE_TYPE = NSDTransferDiscovery.RECIEVER_SERVICE_TYPE;
 
@@ -121,13 +120,15 @@ public class AirTransferService extends LifecycleService {
     private ProcessCameraProvider cameraProvider;
     private ImageAnalysis imageAnalysis;
     private ExecutorService cameraExecutor;
-    private final GestureDebouncer gestureDebouncer = new GestureDebouncer();
-
-    private HandGestureClassifier handGestureClassifier;
+    private HandGestureController handGestureController;
+    private final AtomicBoolean gestureFramesEnabled = new AtomicBoolean(false);
+    private boolean gestureCameraPaused;
+    private long lastGestureFrameAtMs;
+    private long gestureCameraFrameNumber;
 
     private final Runnable senderTimeout = () ->{
-        if(roleState == RoleState.SENDER_WAITING || roleState == RoleState.SENDER_CONNECTING){
-            finishSenderAttempt("Timed out waiting for reciever or transfer");
+        if(isSenderState()){
+            finishSenderAttempt("Sender operation timed out");
         }
     };
 
@@ -137,65 +138,6 @@ public class AirTransferService extends LifecycleService {
             showStatus("Receiver server did not start.");
         }
     };
-
-    private void startGestureCamera(){
-
-        if(cameraExecutor!=null){
-            return;
-        }
-
-        cameraExecutor = Executors.newSingleThreadExecutor();
-
-        ListenableFuture<ProcessCameraProvider> cameraProviderFuture = ProcessCameraProvider.getInstance(this);
-        cameraProviderFuture.addListener(() -> {
-            try{
-                cameraProvider = cameraProviderFuture.get();
-
-                imageAnalysis = new ImageAnalysis.Builder()
-                        .setTargetResolution(new Size(640,480))
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                        .build();
-
-                imageAnalysis.setAnalyzer(cameraExecutor, image -> {
-                    long frameStartTime = System.nanoTime();
-                    try{
-                        Bitmap imgbitmap = ImageConverter.toBitmap(image);
-
-                        long timestampMs = image.getImageInfo().getTimestamp() / 1_000_000L;
-                        int rotationDegrees = image.getImageInfo().getRotationDegrees();
-
-                        // Rotate to upright + mirror horizontally (front camera)
-                        Matrix matrix = new Matrix();
-                        matrix.postRotate(rotationDegrees);
-                        matrix.postScale(-1f, 1f);
-                        Bitmap rotatedBitmap = Bitmap.createBitmap(imgbitmap, 0, 0,
-                                imgbitmap.getWidth(), imgbitmap.getHeight(), matrix, true);
-
-                        if(rotatedBitmap !=null && rotatedBitmap != imgbitmap){
-                            imgbitmap.recycle();
-                        }
-                        // Run hand landmark detection on the upright, mirrored frame
-                        // handLandMark.detectAsync(rotatedBitmap, timestampMs, rotationDegrees);
-                        handGestureClassifier.detectAsync(rotatedBitmap, timestampMs);
-                    } finally {
-                        image.close();
-                    }
-                });
-
-                CameraSelector camSelector = CameraSelector.DEFAULT_FRONT_CAMERA;
-
-                try {
-                    cameraProvider.unbindAll();
-                    cameraProvider.bindToLifecycle(this, camSelector, imageAnalysis);
-                } catch(Exception ex){
-                    Log.e(TAG, "Usecase binding failed", ex);
-                }
-            } catch(ExecutionException | InterruptedException e){
-                Log.e(TAG, "Error getting camera provider" + e);
-            }
-        }, ContextCompat.getMainExecutor(this));
-    }
 
     private final MediaProjection.Callback projectionCallback =
             new MediaProjection.Callback() {
@@ -215,8 +157,222 @@ public class AirTransferService extends LifecycleService {
     public void onCreate(){
         super.onCreate();
         transferEffectOverlay = new TransferEffectOverlay(this);
+        gestureDebugOverlay = new GestureDebugOverlay(this);
         createNotificationChannel();
         initializeNSD();
+    }
+
+    private void initializeHandGestureController() {
+        if (handGestureController != null) {
+            return;
+        }
+        handGestureController = new HandGestureController(
+                getApplicationContext(),
+                new HandGestureController.Listener() {
+                    @Override
+                    public void onObservation(HandGestureController.Observation observation) {
+                        mainHandler.post(() -> {
+                            if (gestureDebugOverlay != null) {
+                                gestureDebugOverlay.updateObservation(
+                                        observation, roleState.name());
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onAction(HandGestureController.Action action) {
+                        Log.i(TAG, "GESTURE_ACTION_ACCEPTED action=" + action
+                                + "; roleBeforeAction=" + roleState);
+                        mainHandler.post(() -> {
+                            if (gestureDebugOverlay != null) {
+                                gestureDebugOverlay.setOperationStatus(
+                                        "Accepted gesture: " + action);
+                            }
+                            handleGestureAction(action);
+                        });
+                    }
+
+                    @Override
+                    public void onError(RuntimeException error) {
+                        Log.e(TAG, "Gesture model error", error);
+                        if (gestureDebugOverlay != null) {
+                            gestureDebugOverlay.setOperationStatus(
+                                    "Gesture model error: " + error.getMessage());
+                        }
+                    }
+                }
+        );
+    }
+
+    private void startGestureCamera() {
+        if (cameraExecutor != null) {
+            return;
+        }
+
+        cameraExecutor = Executors.newSingleThreadExecutor();
+        ListenableFuture<ProcessCameraProvider> providerFuture =
+                ProcessCameraProvider.getInstance(this);
+        providerFuture.addListener(() -> {
+            try {
+                cameraProvider = providerFuture.get();
+                imageAnalysis = new ImageAnalysis.Builder()
+                        .setTargetResolution(new Size(640, 480))
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                        .build();
+                bindGestureCamera();
+            } catch (ExecutionException | InterruptedException error) {
+                if (error instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                Log.e(TAG, "Could not initialize CameraX", error);
+            }
+        }, ContextCompat.getMainExecutor(this));
+    }
+
+    private void bindGestureCamera() {
+        if (cameraProvider == null || imageAnalysis == null || cameraExecutor == null) {
+            Log.w(TAG, "Gesture camera is not ready to bind");
+            return;
+        }
+
+        imageAnalysis.setAnalyzer(cameraExecutor, this::analyzeGestureFrame);
+        try {
+            cameraProvider.bindToLifecycle(
+                    this,
+                    CameraSelector.DEFAULT_FRONT_CAMERA,
+                    imageAnalysis
+            );
+            gestureFramesEnabled.set(true);
+            gestureCameraPaused = false;
+            Log.i(TAG, "Gesture camera started; sampling at 5 FPS");
+            if (gestureDebugOverlay != null) {
+                gestureDebugOverlay.setOperationStatus("Gesture detector running");
+            }
+        } catch (Exception error) {
+            gestureFramesEnabled.set(false);
+            imageAnalysis.clearAnalyzer();
+            gestureCameraPaused = true;
+            Log.e(TAG, "Could not bind front camera for gesture recognition", error);
+        }
+    }
+
+    private void analyzeGestureFrame(ImageProxy image) {
+        Bitmap bitmap = null;
+        MPImage mpImage = null;
+        boolean submittedToRecognizer = false;
+        try {
+            if (!gestureFramesEnabled.get()) {
+                return;
+            }
+
+            long nowMs = SystemClock.elapsedRealtime();
+            if (nowMs - lastGestureFrameAtMs < GESTURE_FRAME_INTERVAL_MS) {
+                return;
+            }
+            lastGestureFrameAtMs = nowMs;
+
+            int rotationDegrees = image.getImageInfo().getRotationDegrees();
+            bitmap = image.toBitmap();
+            if (bitmap == null) {
+                throw new IllegalStateException("CameraX returned a null bitmap");
+            }
+
+            long frameNumber = ++gestureCameraFrameNumber;
+            if (frameNumber == 1L || frameNumber % 25L == 0L) {
+                Log.i(TAG, "Gesture camera input frame=" + frameNumber
+                        + "; size=" + bitmap.getWidth() + "x" + bitmap.getHeight()
+                        + "; format=" + image.getFormat()
+                        + "; rotationDegrees=" + rotationDegrees
+                        + "; sampledLuma=" + getSampledLumaRange(bitmap));
+            }
+
+            if (handGestureController != null) {
+                mpImage = new BitmapImageBuilder(bitmap).build();
+                ImageProcessingOptions processingOptions = ImageProcessingOptions.builder()
+                        .setRotationDegrees(rotationDegrees)
+                        .build();
+                handGestureController.recognizeAsync(
+                        mpImage,
+                        processingOptions,
+                        SystemClock.uptimeMillis());
+                submittedToRecognizer = true;
+            }
+        } catch (RuntimeException error) {
+            Log.e(TAG, "Could not submit camera frame to gesture model", error);
+        } finally {
+            image.close();
+            if (!submittedToRecognizer) {
+                if (mpImage != null) {
+                    mpImage.close();
+                }
+                if (bitmap != null && !bitmap.isRecycled()) {
+                    bitmap.recycle();
+                }
+            }
+        }
+    }
+
+    /** Sparse luminance sanity check: confirms camera frames contain image data. */
+    private String getSampledLumaRange(Bitmap bitmap) {
+        int min = 255;
+        int max = 0;
+        long sum = 0L;
+        int samples = 0;
+        int stepX = Math.max(1, bitmap.getWidth() / 16);
+        int stepY = Math.max(1, bitmap.getHeight() / 16);
+
+        for (int y = 0; y < bitmap.getHeight(); y += stepY) {
+            for (int x = 0; x < bitmap.getWidth(); x += stepX) {
+                int color = bitmap.getPixel(x, y);
+                int luma = (int) (0.299 * android.graphics.Color.red(color)
+                        + 0.587 * android.graphics.Color.green(color)
+                        + 0.114 * android.graphics.Color.blue(color));
+                min = Math.min(min, luma);
+                max = Math.max(max, luma);
+                sum += luma;
+                samples++;
+            }
+        }
+
+        int average = samples == 0 ? 0 : (int) (sum / samples);
+        return "avg=" + average + ",min=" + min + ",max=" + max;
+    }
+
+    private void pauseGestureCamera() {
+        gestureFramesEnabled.set(false);
+        gestureCameraPaused = true;
+        if (imageAnalysis != null) {
+            imageAnalysis.clearAnalyzer();
+        }
+        if (cameraProvider != null && imageAnalysis != null) {
+            cameraProvider.unbind(imageAnalysis);
+        }
+        Log.i(TAG, "Gesture camera paused for transfer operation");
+        if (gestureDebugOverlay != null) {
+            gestureDebugOverlay.setOperationStatus(
+                    "Gesture camera paused while transfer operation runs");
+        }
+    }
+
+    private void resumeGestureCamera() {
+        if (!gestureCameraPaused) {
+            return;
+        }
+        if (handGestureController != null) {
+            handGestureController.requireDifferentPoseOrHandRemoval();
+        }
+        bindGestureCamera();
+    }
+
+    private void handleGestureAction(HandGestureController.Action action) {
+        Log.i(TAG, "Accepted gesture action=" + action + "; role=" + roleState);
+        pauseGestureCamera();
+        if (action == HandGestureController.Action.SEND) {
+            startSenderMode();
+        } else if (action == HandGestureController.Action.RECEIVE) {
+            startRecieverMode();
+        }
     }
 
     private void initializeNSD(){
@@ -323,53 +479,6 @@ public class AirTransferService extends LifecycleService {
         return roleState == RoleState.RECIEVER_STARTING || roleState == RoleState.RECIEVER_LISTENING;
     }
 
-    private void initializeHandGestureClassifier(){
-        if(handGestureClassifier != null){
-            return;
-        }
-
-        handGestureClassifier = new HandGestureClassifier(
-                getApplicationContext(),
-                new HandGestureClassifier.Listener() {
-                    @Override
-                    public void onObservation(
-                            GestureType pose,
-                            boolean handDetected,
-                            float openScore,
-                            float closedScore
-                    ) {
-                        GestureEvent event = gestureDebouncer.update(
-                                pose,
-                                handDetected,
-                                SystemClock.elapsedRealtime()
-                        );
-                        if(event != null){
-                            mainHandler.post(()->handleGestureEvent(event));
-                        }
-                    }
-
-                    @Override
-                    public void onError(RuntimeException error) {
-                        Log.e(TAG,"Gesture classifier failed"+error);
-                    }
-                }
-        );
-    }
-    private void handleGestureEvent(GestureEvent event){
-        Log.i(TAG,"Handling gesture event=" + event + " roleState=" + roleState);
-        if(event.getKind() == GestureEvent.Kind.GRAB){
-            Log.i(TAG,"Closed fist recognized,starting senderFile");
-            startSenderMode();
-            return;
-        }
-        if(event.getKind() == GestureEvent.Kind.RELEASE){
-            Log.i(TAG,"Closed fist recognized,starting senderFile");
-            startRecieverMode();
-            return;
-        }
-
-    }
-
     private void startSenderMode(){
         if(roleState != RoleState.IDLE){
             Log.w(TAG,"roleState is not idle");
@@ -378,6 +487,7 @@ public class AirTransferService extends LifecycleService {
         if(mediaProjection == null || imageReader == null){
             Log.w(TAG,"mediaprojection or imageReader is null");
             showStatus("Screen capture is not active");
+            resumeGestureCamera();
             return;
         }
 
@@ -410,12 +520,14 @@ public class AirTransferService extends LifecycleService {
 
         if(visibleSenderOffers.isEmpty()){
             showStatus("No sender offer detected. Do GRAB on sender first");
+            resumeGestureCamera();
             return;
         }
 
         if(visibleSenderOffers.size()>1){
             showStatus("Multiple senders detected. Cancel them to proceed");
             Log.i(TAG,"Ignoring release. Offers detected=" + visibleSenderOffers.keySet());
+            resumeGestureCamera();
             return;
         }
         NSDTransferDiscovery.Peer offer = visibleSenderOffers.values().iterator().next();
@@ -441,8 +553,13 @@ public class AirTransferService extends LifecycleService {
             }
             mainHandler.postDelayed(()->{
                 if(expectedSessionId.equals(activeRecieverSessionId) && roleState == RoleState.RECIEVER_LISTENING){
-                    openRecievedImage(uri,mimeType,displayName);
-                    finishRecieverSession("Image recieved successfully");
+                    try {
+                        openRecievedImage(uri,mimeType,displayName);
+                    } catch (RuntimeException error) {
+                        Log.e(TAG, "Could not open the received-image viewer", error);
+                    } finally {
+                        finishRecieverSession("Image recieved successfully");
+                    }
                 }
             },1000L);
         });
@@ -530,6 +647,7 @@ public class AirTransferService extends LifecycleService {
         activeRecieverSessionId = null;
         receiverTransferCompleted.set(false);
         showStatus(message);
+        resumeGestureCamera();
     }
 
 
@@ -563,9 +681,11 @@ public class AirTransferService extends LifecycleService {
         }
 
         startForegroundForeground();
-        initializeHandGestureClassifier();
+        if (gestureDebugOverlay != null) {
+            gestureDebugOverlay.show();
+        }
+        initializeHandGestureController();
         startGestureCamera();
-
         startProjection(resultCode,resultData);
         return START_NOT_STICKY;
     }
@@ -583,7 +703,8 @@ public class AirTransferService extends LifecycleService {
 
         Notification notification = createNotification(stopPendingIntent);
         if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q){
-            int serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
+            int serviceType = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                    | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
             startForeground(NOTIFICATION_ID,notification, serviceType);
         }
         else{
@@ -681,7 +802,8 @@ public class AirTransferService extends LifecycleService {
                 return;
             }
             if(!capturePending.get()){
-                Log.i(TAG,"capture pending is false");
+                // MediaProjection keeps delivering display frames continuously. Ignore them
+                // silently until a gesture actually requests a screen capture.
                 return;
             }
 
@@ -881,6 +1003,10 @@ public class AirTransferService extends LifecycleService {
             return;
         }
         mainHandler.removeCallbacks(senderTimeout);
+        // The discovery/capture timeout has ended. Give the actual socket send
+        // its own bounded interval so a stalled transfer cannot leave the
+        // sender session active indefinitely.
+        mainHandler.postDelayed(senderTimeout, SENDER_TIMEOUT_MS);
         roleState = RoleState.SENDER_SENDING;
 
         transferEffectOverlay.show(TransferEffectOverlay.Phase.SENDING);
@@ -953,7 +1079,10 @@ public class AirTransferService extends LifecycleService {
         if(transferEffectOverlay!=null){
             transferEffectOverlay.remove();
         }
-
+        if (gestureDebugOverlay != null) {
+            gestureDebugOverlay.remove();
+            gestureDebugOverlay = null;
+        }
         if(imageReader != null){
             imageReader.setOnImageAvailableListener(null,null);
             imageReader.close();
@@ -980,17 +1109,20 @@ public class AirTransferService extends LifecycleService {
             captureThread = null;
             captureHandler = null;
         }
-        if(cameraProvider != null && imageAnalysis != null){
+        gestureFramesEnabled.set(false);
+        if (imageAnalysis != null) {
+            imageAnalysis.clearAnalyzer();
+        }
+        if (cameraProvider != null && imageAnalysis != null) {
             cameraProvider.unbind(imageAnalysis);
         }
-
-        if(cameraExecutor != null){
+        if (cameraExecutor != null) {
             cameraExecutor.shutdown();
+            cameraExecutor = null;
         }
-
-        if(handGestureClassifier != null){
-            handGestureClassifier.cleanup();
-            handGestureClassifier = null;
+        if (handGestureController != null) {
+            handGestureController.close();
+            handGestureController = null;
         }
     }
 
@@ -1067,6 +1199,7 @@ public class AirTransferService extends LifecycleService {
         activeSenderSessionId = null;
         roleState = RoleState.IDLE;
         showStatus(message);
+        resumeGestureCamera();
     }
 
     private void releaseNetworkResources() {
@@ -1105,7 +1238,12 @@ public class AirTransferService extends LifecycleService {
 
     private void showStatus(String message){
         Log.i(TAG,message);
-        mainHandler.post(()->Toast.makeText(getApplicationContext(),message,Toast.LENGTH_SHORT).show());
+        mainHandler.post(()->{
+            if (gestureDebugOverlay != null) {
+                gestureDebugOverlay.setOperationStatus(message);
+            }
+            Toast.makeText(getApplicationContext(),message,Toast.LENGTH_SHORT).show();
+        });
 
     }
 }
