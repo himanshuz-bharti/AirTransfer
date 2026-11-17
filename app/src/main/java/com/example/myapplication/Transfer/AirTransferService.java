@@ -98,7 +98,7 @@ public class AirTransferService extends LifecycleService {
     public static final String EXTRA_RESULT_CODE = "com.example.myapplication.EXTRA_RESULT_CODE";
     public static final String EXTRA_RESULT_DATA = "com.example.myapplication.EXTRA_RESULT_DATA";
 
-    private static final String ACTION_STOP = "com.example.myapplication.ACTION_STOP_AIR_TRANSFER";
+    public static final String ACTION_STOP = "com.example.myapplication.ACTION_STOP_AIR_TRANSFER";
 
     private final AtomicBoolean capturePending = new AtomicBoolean(false);
     private final AtomicBoolean receiverTransferCompleted = new AtomicBoolean(false);
@@ -126,6 +126,10 @@ public class AirTransferService extends LifecycleService {
     private long lastGestureFrameAtMs;
     private long gestureCameraFrameNumber;
 
+    private boolean stopping;
+    private boolean startAccepted;
+    private boolean networkResourcesReleased;
+
     private final Runnable senderTimeout = () ->{
         if(isSenderState()){
             finishSenderAttempt("Sender operation timed out");
@@ -145,10 +149,8 @@ public class AirTransferService extends LifecycleService {
                 public void onStop() {
                     super.onStop();
                     Log.i(TAG,"MediaProjection stopped by system/user");
-                    releaseCaptureResources(false);
                     mainHandler.post(()->{
-                        stopForeground(STOP_FOREGROUND_REMOVE);
-                        stopSelf();
+                        stopEverything("MediaProjection stopped by system/user",false);
                     });
                 }
             };
@@ -366,6 +368,10 @@ public class AirTransferService extends LifecycleService {
     }
 
     private void handleGestureAction(HandGestureController.Action action) {
+        if(stopping){
+            Log.w(TAG,"Ignore gesture as the service is stopping");
+            return;
+        }
         Log.i(TAG, "Accepted gesture action=" + action + "; role=" + roleState);
         pauseGestureCamera();
         if (action == HandGestureController.Action.SEND) {
@@ -387,7 +393,7 @@ public class AirTransferService extends LifecycleService {
 
                     @Override
                     public void onPeerFound(NSDTransferDiscovery.Peer peer) {
-                        if(peer.sessionId == null || peer.sessionId.isEmpty()){
+                        if(peer==null || peer.sessionId == null || peer.sessionId.isEmpty()){
                             Log.w(TAG,"Ignore peers without a sessionId");
                             return;
                         }
@@ -433,6 +439,10 @@ public class AirTransferService extends LifecycleService {
                     @Override
                     public void onPeerFound(NSDTransferDiscovery.Peer peer) {
                         Log.i(TAG,"Reciever discovered");
+                        if(peer==null || peer.sessionId == null || peer.sessionId.isEmpty()){
+                            Log.w(TAG,"Ignore peers without a sessionId");
+                            return;
+                        }
                         if(roleState != RoleState.SENDER_WAITING){
                             return;
                         }
@@ -660,9 +670,14 @@ public class AirTransferService extends LifecycleService {
             return START_NOT_STICKY;
         }
         if(ACTION_STOP.equals(intent.getAction())){
-            releaseCaptureResources(true);
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            stopSelf();
+            stopEverything("Stopped by user.",true);
+            return START_NOT_STICKY;
+        }
+        if(stopping){
+            return START_NOT_STICKY;
+        }
+        if(startAccepted){
+            Log.w(TAG,"Ignoring duplicate AirTransfer start request");
             return START_NOT_STICKY;
         }
         int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE,0);
@@ -676,18 +691,58 @@ public class AirTransferService extends LifecycleService {
 
         if(resultData==null){
             Log.d(TAG,"Projection result data is missing");
-            stopSelf();
+            stopEverything("Projection result data is missing",true);
             return START_NOT_STICKY;
         }
 
-        startForegroundForeground();
-        if (gestureDebugOverlay != null) {
-            gestureDebugOverlay.show();
+        startAccepted = true;
+
+        try{
+            startForegroundForeground();
+            if (gestureDebugOverlay != null) {
+                gestureDebugOverlay.show();
+            }
+            initializeHandGestureController();
+            startGestureCamera();
+            startProjection(resultCode,resultData);
+
+        }catch(RuntimeException error){
+            Log.e(TAG,"Could not start AirTransferService");
+            stopEverything("Could not start AirTransferService",true);
         }
-        initializeHandGestureController();
-        startGestureCamera();
-        startProjection(resultCode,resultData);
         return START_NOT_STICKY;
+    }
+
+    private void stopEverything(String reason,boolean stopProjection){
+        if(stopping){
+            stopSelf();
+            return;
+        }
+
+        stopping = true;
+        stopForeground(STOP_FOREGROUND_REMOVE);
+
+        mainHandler.removeCallbacks(senderTimeout);
+        mainHandler.removeCallbacks(receiverStartupTimeout);
+
+        if(recieverSessionTimeout!=null){
+            mainHandler.removeCallbacks(recieverSessionTimeout);
+            recieverSessionTimeout = null;
+        }
+        try{
+            releaseNetworkResources();
+        } catch(RuntimeException error){
+            Log.e(TAG,"Error stopping network resources"+error);
+        }
+
+        galleryMatchExecutor.shutdownNow();
+        wsExecutor.shutdownNow();
+        try{
+            releaseCaptureResources(stopProjection);
+        }catch(RuntimeException error){
+            Log.e(TAG,"Error stopping camera/capture resources"+error);
+        }
+        stopSelf();
     }
 
     private void startForegroundForeground(){
@@ -717,7 +772,7 @@ public class AirTransferService extends LifecycleService {
                 getSystemService(Context.MEDIA_PROJECTION_SERVICE);
         if(manager == null){
             Log.i(TAG,"mediaprojection manager is null");
-            stopSelf();
+            stopEverything("mediaprojection manager is null",true);
             return;
         }
 
@@ -725,7 +780,7 @@ public class AirTransferService extends LifecycleService {
             mediaProjection = manager.getMediaProjection(resultCode,resultData);
             if(mediaProjection == null){
                 Log.i(TAG,"Could not obtain mediaProjection");
-                stopSelf();
+                stopEverything("Could not obtain mediaProjection",true);
                 return;
             }
 
@@ -773,9 +828,7 @@ public class AirTransferService extends LifecycleService {
             Log.i(TAG,"Projection staretd at" + width + "x" + height);
         } catch(Exception e){
             Log.e(TAG,"Could not start screen projection",e);
-            releaseCaptureResources(true);
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            stopSelf();
+            stopEverything("Could not start screen projection",true);
         }
     }
 
@@ -918,9 +971,31 @@ public class AirTransferService extends LifecycleService {
     }
 
     private void maybeConnectToReciever(){
-        if(roleState != RoleState.SENDER_WAITING || pendingItemUri == null
-                || activeSenderSessionId == null ||
-                !activeSenderSessionId.equals(pendingReciever.sessionId)){
+        if(stopping){
+            return;
+        }
+        if(roleState != RoleState.SENDER_WAITING){
+            Log.e(TAG,"Cannot connect, Sender is not waiting.Sender:"+roleState);
+            return;
+        }
+        if(pendingItemUri == null){
+            Log.e(TAG,"Image is not ready yet. waiting for gallery matching.");
+            return;
+        }
+        NSDTransferDiscovery.Peer reciever = pendingReciever;
+        if(reciever == null){
+            Log.e(TAG,"Image is ready.reciever is null");
+            return;
+        }
+
+        if(activeSenderSessionId == null || reciever.sessionId == null || reciever.sessionId.isEmpty() ||
+                  !reciever.sessionId.equalsIgnoreCase(activeSenderSessionId)){
+            Log.e(TAG, "Receiver session ID does not match active sender session ID.");
+            return;
+        }
+
+        if(reciever.hostAddress == null || reciever.port<=0){
+            Log.i(TAG,"reciever has no usable port or ");
             return;
         }
         recieverNsd.stopDiscovery();
@@ -1128,9 +1203,13 @@ public class AirTransferService extends LifecycleService {
 
     @Override
     public void onDestroy(){
+        stopping =  true;
+        stopForeground(STOP_FOREGROUND_REMOVE);
         releaseNetworkResources();
+
         galleryMatchExecutor.shutdownNow();
         wsExecutor.shutdownNow();
+
         releaseCaptureResources(true);
         super.onDestroy();
     }
@@ -1203,8 +1282,16 @@ public class AirTransferService extends LifecycleService {
     }
 
     private void releaseNetworkResources() {
+        if(networkResourcesReleased){
+            return;
+        }
+        networkResourcesReleased = true;
         mainHandler.removeCallbacks(senderTimeout);
         mainHandler.removeCallbacks(receiverStartupTimeout);
+        if(recieverSessionTimeout!=null){
+            mainHandler.removeCallbacks(recieverSessionTimeout);
+            recieverSessionTimeout = null;
+        }
         capturePending.set(false);
         roleState = RoleState.IDLE;
         pendingItemUri = null;
