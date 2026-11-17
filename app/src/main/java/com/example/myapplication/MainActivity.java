@@ -54,6 +54,7 @@ public class MainActivity extends AppCompatActivity {
             }
             if(++stopCheckCount<MAX_STOP_CHECKS){
                 uiHandler.postDelayed(this,STOP_CHECK_INTERVAL_MS);
+                return;
             }
 
             stopRequestPending = false;
@@ -179,6 +180,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume(){
         super.onResume();
+        refreshServiceControls();
 
     }
 
@@ -192,7 +194,9 @@ public class MainActivity extends AppCompatActivity {
             uiHandler.removeCallbacks(stopStateCheck);
             uiHandler.post(stopStateCheck);
         } else if(running){
-
+            statusText.setText("Gesture transfer is running");
+        } else if(!permissionInProgress){
+            statusText.setText("Gesture transfer stopped");
         }
 
     }

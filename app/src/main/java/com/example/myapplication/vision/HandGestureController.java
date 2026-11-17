@@ -119,28 +119,10 @@ public final class HandGestureController implements AutoCloseable {
             return String.format(Locale.US,
                     "AIR GESTURE DEBUG\n"
                             + "Hand: %s   Model: %s\n"
-                            + "Decision: %s\n"
-                            + "Open palm: %.3f\nClosed fist: %.3f\n"
-                            + "Delta (open - fist): %+.3f\n"
-                            + "Votes in 1s (open/fist): %d/%d\n"
-                            + "Pose span: %d ms   Ready: %s\n"
-                            + "Decision source: %s\n"
-                            + "Gesture latch: %s (%s)\nRole: %s\n%s",
+                            + "Decision: %s\n",
                     handDetected ? "DETECTED" : "NOT DETECTED",
                     modelWinner,
-                    qualifiedPose,
-                    openScore,
-                    closedScore,
-                    scoreDelta,
-                    openVotes,
-                    closedVotes,
-                    stableSpanMs,
-                    readyToTrigger,
-                    closedFallback ? "non-open hand fallback" : "model",
-                    latched ? "WAIT FOR OPPOSITE POSE OR HAND REMOVAL" : "ARMED",
-                    latchedPose,
-                    serviceState,
-                    operationStatus);
+                    qualifiedPose);
         }
     }
 
