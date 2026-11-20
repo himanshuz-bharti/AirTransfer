@@ -1,14 +1,10 @@
-
-
-https://github.com/user-attachments/assets/237af123-8b1e-4069-ab1c-f3836d6736a9
-
 # Air Gesture Transfer
 
 Air Gesture Transfer is an Android prototype for sharing an image with hand gestures. The sender shows a closed fist, the app looks for the image currently visible on screen in the sender's Gallery, and a nearby receiver can accept the image with an open palm.
 
 ## Demo
 
-**Demo video:** The correct video will appear here after `hand_gesture_transfer_revised.mp4` is uploaded through GitHub's README editor. See [Adding the demo video](#adding-the-demo-video).
+https://github.com/user-attachments/assets/237af123-8b1e-4069-ab1c-f3836d6736a9
 
 ## How it works
 
@@ -105,11 +101,9 @@ app/src/main/
 +-- res/                     Android layouts, strings, and app resources
 ```
 
-## Downloading the APK
+## Download the APK
 
-For a quick local test, use the debug APK produced by the build steps above. Download the signed APK from the [latest GitHub Release](https://github.com/himanshuz-bharti/VisionOS/releases/latest/download/app-release.apk). This direct link expects the release asset to be named `app-release.apk`.
-
-See [Publishing the APK](#publishing-the-apk-on-github) for the steps.
+Download the [latest signed APK](https://github.com/himanshuz-bharti/VisionOS/releases/latest/download/app-release.apk) from GitHub Releases. The release asset is named `app-release.apk`.
 
 ## Current status
 
@@ -119,27 +113,3 @@ This is a prototype. Gesture recognition, screen capture, image matching, discov
 
 There is currently no `LICENSE` file in this repository. Choose and add a license before presenting the source as open source or granting others reuse rights.
 
-## Adding the demo video
-
-The source video is `hand_gesture_transfer_revised.mp4`. A YouTube Shorts URL cannot play inline in a GitHub README, and a thumbnail linked to YouTube would still send readers there when clicked.
-
-To let visitors play the video without leaving the README, upload the **original MP4 file** to GitHub and use its attachment URL:
-
-1. Open this repository on GitHub and edit `README.md` in the web editor.
-2. Put the cursor below **Demo video** and drag `hand_gesture_transfer_revised.mp4` from your computer into the editor. GitHub uploads the file and inserts an attachment URL.
-3. Keep the generated `https://github.com/user-attachments/assets/...` URL on its own line, then commit the README change. GitHub renders uploaded video attachments as an inline player.
-
-You can also first drag the MP4 into an issue or discussion comment, copy its generated attachment URL, and paste that URL on its own line in the README. GitHub supports MP4, MOV, and WebM attachments and recommends H.264 for browser compatibility. The current upload limit for videos is 10 MB on free-plan repositories and 100 MB on paid-plan repositories. If the original file is unavailable, the YouTube link can only be presented as a link or clickable thumbnail. See GitHub's [video upload announcement](https://github.blog/changelog/2021-05-13-video-uploads-now-generally-available/) and [attachment guide](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/attaching-files).
-
-## Publishing the APK on GitHub
-
-1. In Android Studio, choose **Build -> Generate Signed Bundle / APK -> APK**, then click **Next**.
-2. Select the `app` module. If you do not already have a release keystore, choose **Create new** and save a `.jks` keystore somewhere outside this repository. Set a key alias, strong passwords, and a validity period of at least 25 years. Back up the keystore and remember the passwords; keep both private and do not commit them to GitHub. You need the same key to sign future updates.
-3. Select the `release` build variant, choose an output folder, and finish the wizard. Android Studio creates the signed APK and shows its location when the build completes. The signed file in this workspace is `app/release/app-release.apk`.
-4. On GitHub, open the repository and select **Releases -> Draft a new release**.
-5. Create a version tag such as `v1.0.0`, add a short release description, and upload `app/release/app-release.apk` as a release asset named exactly `app-release.apk`.
-6. Publish the release. The direct download link in this README points to the latest release asset named `app-release.apk`; update the link if you use a different asset filename.
-
-The existing `assembleDebug` build creates a debug APK for testing; it is not the release artifact to give users. The Android Studio signing wizard creates the shareable release APK. Before publishing later app updates, increase `versionCode` in `app/build.gradle.kts` and sign with the same keystore so Android can install the update over the existing app.
-
-The APK is about 129 MiB, so keep it as a release asset instead of committing it to normal Git history. GitHub blocks regular repository files over 100 MiB, while each release asset can be up to 2 GiB. See GitHub's documentation for [creating releases](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository), [release asset limits](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases), and [repository file limits](https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-large-files-on-github).
