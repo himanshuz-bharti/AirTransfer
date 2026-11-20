@@ -1,3 +1,7 @@
+
+
+https://github.com/user-attachments/assets/237af123-8b1e-4069-ab1c-f3836d6736a9
+
 # Air Gesture Transfer
 
 Air Gesture Transfer is an Android prototype for sharing an image with hand gestures. The sender shows a closed fist, the app looks for the image currently visible on screen in the sender's Gallery, and a nearby receiver can accept the image with an open palm.
