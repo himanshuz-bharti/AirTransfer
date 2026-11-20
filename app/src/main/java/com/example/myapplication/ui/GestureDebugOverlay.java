@@ -122,6 +122,8 @@ public final class GestureDebugOverlay {
                     + "Status: " + operationStatus);
             return;
         }
+        textView.setText(latestObservation.toOverlayText(serviceState, operationStatus)
+                + "\nScore = model confidence, not measured accuracy");
     }
 
     private void removeOnMainThread() {

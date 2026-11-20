@@ -60,6 +60,7 @@ public class AirTransferService extends LifecycleService {
 
     private enum RoleState{
         IDLE,
+        SENDER_ELECTING,
         SENDER_WAITING,
         SENDER_CONNECTING,
         SENDER_SENDING,
@@ -99,6 +100,7 @@ public class AirTransferService extends LifecycleService {
     public static final String EXTRA_RESULT_DATA = "com.example.myapplication.EXTRA_RESULT_DATA";
 
     public static final String ACTION_STOP = "com.example.myapplication.ACTION_STOP_AIR_TRANSFER";
+    private static final String SENDER_LOCK_SERVICE_NAME = "AirTransferSenderLock";
 
     private final AtomicBoolean capturePending = new AtomicBoolean(false);
     private final AtomicBoolean receiverTransferCompleted = new AtomicBoolean(false);
@@ -133,6 +135,7 @@ public class AirTransferService extends LifecycleService {
     private final Runnable senderTimeout = () ->{
         if(isSenderState()){
             finishSenderAttempt("Sender operation timed out");
+            showStatus("Sender operation timed out");
         }
     };
 
@@ -397,6 +400,13 @@ public class AirTransferService extends LifecycleService {
                             Log.w(TAG,"Ignore peers without a sessionId");
                             return;
                         }
+                        if(!SENDER_LOCK_SERVICE_NAME.equalsIgnoreCase(peer.serviceName)){
+                            Log.i(TAG,"Ignoring peer with invalid fixedservicename:"+peer.serviceName);
+                            return;
+                        }
+                        if(peer.sessionId.equals(activeSenderSessionId)){
+                            return;
+                        }
                         visibleSenderOffers.put(peer.sessionId,peer);
                         Log.i(TAG, "Sender offer detected role=");
                     }
@@ -404,7 +414,10 @@ public class AirTransferService extends LifecycleService {
                     @Override
                     public void onPeerLost(NSDTransferDiscovery.Peer peer) {
                         Log.i(TAG,"Sender offer lost");
-
+                        if(peer==null){
+                            Log.w(TAG,"Peer is null");
+                            return;
+                        }
                         if(peer.sessionId!=null){
                             visibleSenderOffers.remove(peer.sessionId);
                         }
@@ -482,7 +495,7 @@ public class AirTransferService extends LifecycleService {
     }
 
     private boolean isSenderState(){
-        return roleState == RoleState.SENDER_WAITING || roleState == RoleState.SENDER_CONNECTING || roleState == RoleState.SENDER_SENDING;
+        return roleState == RoleState.SENDER_ELECTING || roleState == RoleState.SENDER_WAITING || roleState == RoleState.SENDER_CONNECTING || roleState == RoleState.SENDER_SENDING;
     }
 
     private boolean isRecieverState(){
@@ -492,6 +505,12 @@ public class AirTransferService extends LifecycleService {
     private void startSenderMode(){
         if(roleState != RoleState.IDLE){
             Log.w(TAG,"roleState is not idle");
+            resumeGestureCamera();
+            return;
+        }
+        if(!visibleSenderOffers.isEmpty()){
+            showStatus("Another device is sending, open palms to receive it");
+            resumeGestureCamera();
             return;
         }
         if(mediaProjection == null || imageReader == null){
@@ -503,20 +522,45 @@ public class AirTransferService extends LifecycleService {
 
         activeSenderSessionId = UUID.randomUUID().toString();
 
-        roleState = RoleState.SENDER_WAITING;
+        roleState = RoleState.SENDER_ELECTING;
         pendingItemUri = null;
         pendingReciever = null;
 
         mainHandler.removeCallbacks(senderTimeout);
         mainHandler.postDelayed(senderTimeout,SENDER_TIMEOUT_MS);
-        if(!requestScreenCapture()){
-            finishSenderAttempt("Could not get screen capture");
-            return;
-        }
 
-        offerNsd.startAdvertising(Build.MODEL,RECIEVER_PORT,activeSenderSessionId);
+        offerNsd.startAdvertising(Build.MODEL, RECIEVER_PORT, activeSenderSessionId, SENDER_LOCK_SERVICE_NAME,
+                new NSDTransferDiscovery.AdvertisingCallback() {
+                    @Override
+                    public void onStarted(String actualServiceName) {
+                        mainHandler.post(()->{
+                            if(stopping || roleState != RoleState.SENDER_ELECTING){
+                                offerNsd.stopAdvertising();
+                                return;
+                            }
+                            if(!SENDER_LOCK_SERVICE_NAME.equalsIgnoreCase(actualServiceName)){
+                                finishSenderAttempt("This device did not acquire the sender lock");
+                                return;
+                            }
+                            roleState = RoleState.SENDER_WAITING;
+                            if(!requestScreenCapture()){
+                                finishSenderAttempt("Could not get screen capture");
+                                return;
+                            }
+                            recieverNsd.startDiscovery();
+                            showStatus("Sender claimed; capturing and matching Gallery");
+                        });
+                    }
 
-        recieverNsd.startDiscovery();
+                    @Override
+                    public void onFailed(String reason) {
+                        mainHandler.post(()->{
+                            if(roleState == RoleState.SENDER_ELECTING){
+                                finishSenderAttempt("Another device already owns sender role");
+                            }
+                        });
+                    }
+                });
 
         showStatus("Finding reciever and gallery matching started");
     }

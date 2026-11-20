@@ -20,9 +20,14 @@ public class NSDTransferDiscovery {
     private static final String TAG = "NSDTransferDiscovery";
     public static final String RECIEVER_SERVICE_TYPE = "_airtransfer._tcp.";
     public static final String OFFER_SERVICE_TYPE = "_airoffer._tcp.";
+    public static final String CLAIM_SERVICE_TYPE = "_airclaim._tcp.";
 
     private final String serviceType;
 
+    public interface AdvertisingCallback{
+        void onStarted(String actualServiceName);
+        void onFailed(String reason);
+    }
     public interface Listener{
         void onStatus(String message);
         void onPeerFound(Peer peer);
@@ -77,22 +82,44 @@ public class NSDTransferDiscovery {
     }
 
     public void startAdvertising(String deviceName,int port,String sessionId){
+        startAdvertising(deviceName,port,sessionId,null,null);
+    }
+
+    public void startAdvertising(String deviceName,int port,String sessionId,String fixedServiceName,AdvertisingCallback callback){
         if(advertisingRequested){
-            Log.e(TAG,"An advertising is already requested");
+            String reason = "An advertising is already requested";
+            Log.e(TAG, reason);
+            if(callback!=null){
+                callback.onFailed(reason);
+            }
             return;
         }
         if(sessionId==null || sessionId.isEmpty()){
-            Log.e(TAG,"Cannpt advertise without a sessionId");
+            String reason = "Cannot advertise without a sessionId";
+            Log.e(TAG,reason);
+            if(callback!=null){
+                callback.onFailed(reason);
+            }
             return;
         }
         if(port<1 || port>65535){
-            Log.e(TAG,"Invalid port received. Cannot execute startAdvertising");
+            String reason = "Invalid port received. Cannot execute startAdvertising";
+            Log.e(TAG,reason);
+            if(callback!=null){
+                callback.onFailed(reason);
+            }
             return;
         }
         advertisingRequested = true;
-        String safeName = sanitizeName(deviceName);
-        String shortSessionId = sessionId.substring(0, Math.min(8,sessionId.length()));
-        String requestedServiceName = "Airtransfer-" +safeName + shortSessionId;
+        String requestedServiceName;
+        if(fixedServiceName!=null && !fixedServiceName.trim().isEmpty()){
+            requestedServiceName = fixedServiceName;
+        }
+        else{
+            String safeName = sanitizeName(deviceName);
+            String shortSessionId = sessionId.substring(0, Math.min(8,sessionId.length()));
+            requestedServiceName = "Airtransfer-" +safeName + shortSessionId;
+        }
 
         NsdServiceInfo serviceInfo = new NsdServiceInfo();
         serviceInfo.setServiceName(requestedServiceName);
@@ -105,7 +132,11 @@ public class NSDTransferDiscovery {
             public void onRegistrationFailed(NsdServiceInfo nsdServiceInfo, int i) {
                 serviceRegistered = false;
                 advertisingRequested = false;
+                String reason = "Registration advertisement failed" + i;
                 postError("Registration advertisement failed", i);
+                if(callback!=null){
+                    callback.onFailed(reason);
+                }
             }
 
             @Override
@@ -117,9 +148,24 @@ public class NSDTransferDiscovery {
                         + " type=" + nsdServiceInfo.getServiceType()
                         + " port=" + nsdServiceInfo.getPort());
 
-                postStatus("registration advertisement done. Disocverable as "+registeredServiceName);
                 if(!advertisingRequested){
                     unregisterRegisteredService();
+                    return;
+                }
+                if(fixedServiceName!=null && !fixedServiceName.equalsIgnoreCase(registeredServiceName)){
+                    advertisingRequested = false;
+                    String reason = "Sender lock is already held.NSD assigned:"+registeredServiceName;
+                    postStatus(reason);
+                    if(callback!=null){
+                        callback.onFailed(reason);
+                    } else{
+                        stopAdvertising();
+                    }
+                    return;
+                }
+                postStatus("Discoverable as:"+registeredServiceName);
+                if(callback!=null){
+                    callback.onStarted(registeredServiceName);
                 }
             }
 
