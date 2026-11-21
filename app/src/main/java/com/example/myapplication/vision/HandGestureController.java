@@ -119,10 +119,14 @@ public final class HandGestureController implements AutoCloseable {
             return String.format(Locale.US,
                     "AIR GESTURE DEBUG\n"
                             + "Hand: %s   Model: %s\n"
-                            + "Decision: %s\n",
+                            + "Decision: %s\n"
+                            + "Role: %s\n"
+                            + "Status: %s",
                     handDetected ? "DETECTED" : "NOT DETECTED",
                     modelWinner,
-                    qualifiedPose);
+                    qualifiedPose,
+                    serviceState,
+                    operationStatus);
         }
     }
 

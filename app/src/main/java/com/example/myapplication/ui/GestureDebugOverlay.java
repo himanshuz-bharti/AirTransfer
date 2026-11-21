@@ -30,6 +30,10 @@ public final class GestureDebugOverlay {
     private HandGestureController.Observation latestObservation;
     private String serviceState = "STARTING";
     private String operationStatus = "Starting gesture detector";
+    private String peerStatus = "No peer connected";
+    private String discoveryStatus = "Idle";
+    private String connectionStatus = "Not connected";
+    private String transferStatus = "Idle";
 
     public GestureDebugOverlay(Context context) {
         this.context = context.getApplicationContext();
@@ -59,6 +63,41 @@ public final class GestureDebugOverlay {
         });
     }
 
+    public void updateServiceState(String state) {
+        mainHandler.post(() -> {
+            serviceState = state;
+            render();
+        });
+    }
+
+    public void setPeerStatus(String status) {
+        mainHandler.post(() -> {
+            peerStatus = status;
+            render();
+        });
+    }
+
+    public void setDiscoveryStatus(String status) {
+        mainHandler.post(() -> {
+            discoveryStatus = status;
+            render();
+        });
+    }
+
+    public void setConnectionStatus(String status) {
+        mainHandler.post(() -> {
+            connectionStatus = status;
+            render();
+        });
+    }
+
+    public void setTransferStatus(String status) {
+        mainHandler.post(() -> {
+            transferStatus = status;
+            render();
+        });
+    }
+
     public void remove() {
         mainHandler.post(this::removeOnMainThread);
     }
@@ -78,7 +117,7 @@ public final class GestureDebugOverlay {
         textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         textView.setTypeface(Typeface.MONOSPACE);
         textView.setPadding(dp(12), dp(9), dp(12), dp(9));
-        textView.setMaxLines(14);
+        textView.setMaxLines(18);
         textView.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
 
         GradientDrawable background = new GradientDrawable();
@@ -119,11 +158,18 @@ public final class GestureDebugOverlay {
         if (latestObservation == null) {
             textView.setText("AIR GESTURE DEBUG\nWaiting for first camera result...\n"
                     + "Role: " + serviceState + "\n"
-                    + "Status: " + operationStatus);
+                    + "Status: " + operationStatus + "\n"
+                    + "Discovery: " + discoveryStatus + "\n"
+                    + "Connection: " + connectionStatus + "\n"
+                    + "Peer: " + peerStatus + "\n"
+                    + "Transfer: " + transferStatus);
             return;
         }
         textView.setText(latestObservation.toOverlayText(serviceState, operationStatus)
-                + "\nScore = model confidence, not measured accuracy");
+                + "\nDiscovery: " + discoveryStatus
+                + "\nConnection: " + connectionStatus
+                + "\nPeer: " + peerStatus
+                + "\nTransfer: " + transferStatus);
     }
 
     private void removeOnMainThread() {

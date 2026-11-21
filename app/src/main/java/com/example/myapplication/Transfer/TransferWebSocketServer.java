@@ -8,6 +8,7 @@ import org.java_websocket.server.WebSocketServer;
 
 import java.io.File;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -40,6 +41,7 @@ public class TransferWebSocketServer extends WebSocketServer{
 
     private String chunkTransferId;
     private long chunkFileSize;
+    private long chunkExpectedFileSize;
     private int chunkIndex;
 
     private Path finalFile;
@@ -47,9 +49,16 @@ public class TransferWebSocketServer extends WebSocketServer{
 
     private Runnable serverStartedListener;
     private TransferCompletedListener transferCompletedListener;
+    private ClientConnectionListener clientConnectionListener;
 
     public interface TransferCompletedListener{
         void onTransferCompleted(Uri uri,String mimeType,String diplayName);
+    }
+
+    public interface ClientConnectionListener {
+        void onConnected(String remoteHost, int remotePort);
+        void onDisconnected(String remoteHost, int remotePort);
+        void onTransferActivity(long bytesReceived, long totalBytes);
     }
 
     public TransferWebSocketServer(Context appContext,int port, Path recieveDirectory){
@@ -60,7 +69,12 @@ public class TransferWebSocketServer extends WebSocketServer{
 
     @Override
     public void onOpen(WebSocket conn,ClientHandshake handshake){
-        Log.i(TAG,"Websocket client connected"+conn.getRemoteSocketAddress());
+        String remoteHost = remoteHost(conn);
+        int remotePort = remotePort(conn);
+        Log.i(TAG,"Websocket client connected " + remoteHost + ":" + remotePort);
+        if (clientConnectionListener != null) {
+            clientConnectionListener.onConnected(remoteHost, remotePort);
+        }
     }
 
     @Override
@@ -114,6 +128,7 @@ public class TransferWebSocketServer extends WebSocketServer{
 
             outputStream.write(data);
             chunkFileSize += data.length;
+            notifyTransferActivity(chunkFileSize, chunkExpectedFileSize);
 
             String replyClient = TransferProtocol.START_OK + "|" + chunkTransferId + "|" + chunkIndex;
             conn.send(replyClient);
@@ -133,12 +148,14 @@ public class TransferWebSocketServer extends WebSocketServer{
     public void onClose(WebSocket conn,int code,String reason,boolean remote){
         Log.i(TAG,"websocket disconnected");
         abortTransfer();
+        notifyClientDisconnected(conn);
     }
 
     @Override
     public void onError(WebSocket conn,Exception e){
         Log.e(TAG,"Websocket error:"+e.getMessage());
         abortTransfer();
+        notifyClientDisconnected(conn);
         e.printStackTrace();
     }
 
@@ -156,6 +173,47 @@ public class TransferWebSocketServer extends WebSocketServer{
 
     public void setServerStartedListener(Runnable listener){
         this.serverStartedListener = listener;
+    }
+
+    public void setClientConnectionListener(ClientConnectionListener listener) {
+        this.clientConnectionListener = listener;
+    }
+
+    private void notifyClientDisconnected(WebSocket conn) {
+        if (clientConnectionListener != null) {
+            clientConnectionListener.onDisconnected(remoteHost(conn), remotePort(conn));
+        }
+    }
+
+    private void notifyTransferActivity(long bytesReceived, long totalBytes) {
+        if (clientConnectionListener != null) {
+            clientConnectionListener.onTransferActivity(bytesReceived, totalBytes);
+        }
+    }
+
+    private String remoteHost(WebSocket conn) {
+        InetSocketAddress remote = remoteSocketAddress(conn);
+        if (remote == null) {
+            return "unknown address";
+        }
+        return remote.getAddress() == null
+                ? remote.getHostString()
+                : remote.getAddress().getHostAddress();
+    }
+
+    private int remotePort(WebSocket conn) {
+        InetSocketAddress remote = remoteSocketAddress(conn);
+        return remote == null ? -1 : remote.getPort();
+    }
+
+    private InetSocketAddress remoteSocketAddress(WebSocket conn) {
+        if (conn == null) {
+            return null;
+        }
+        SocketAddress socketAddress = conn.getRemoteSocketAddress();
+        return socketAddress instanceof InetSocketAddress
+                ? (InetSocketAddress) socketAddress
+                : null;
     }
     private void handleStartMessage(WebSocket conn,String[] parts) throws IOException{
         try{
@@ -190,6 +248,7 @@ public class TransferWebSocketServer extends WebSocketServer{
             Files.createDirectories(recieveDirectory);
 
             chunkFileSize = 0;
+            chunkExpectedFileSize = expectedFileSize;
             chunkTransferId = transferId;
             chunkIndex = 0;
 
@@ -204,6 +263,7 @@ public class TransferWebSocketServer extends WebSocketServer{
 
             String reply = TransferProtocol.START_OK + "|" + transferId;
             conn.send(reply);
+            notifyTransferActivity(chunkFileSize, chunkExpectedFileSize);
         } catch(IOException e){
             Log.e(TAG,"Error in handong start message",e);
             abortTransfer();
@@ -240,14 +300,14 @@ public class TransferWebSocketServer extends WebSocketServer{
             Log.i(TAG,"Transfer completed" + chunkTransferId +
                     "to gallery uri:"+ finalImageUri + "of size:" + finalSize);
 
+            String endMessage = TransferProtocol.DONE + "|" + chunkTransferId + "|" + chunkFileSize;
+            conn.send(endMessage);
+
             if(transferCompletedListener != null){
                 String mimeType = appContext.getContentResolver().getType(finalImageUri);
                 transferCompletedListener.onTransferCompleted(finalImageUri,
                         mimeType==null?"image/*":mimeType,displayName);
             }
-
-            String endMessage = TransferProtocol.DONE + "|" + chunkTransferId + "|" + chunkFileSize;
-            conn.send(endMessage);
         } catch(IOException e){
             Log.e(TAG,"error occured in handleEndMessage"+e);
             conn.send(TransferProtocol.ERROR + "|" + e.getMessage());
@@ -266,8 +326,17 @@ public class TransferWebSocketServer extends WebSocketServer{
             outputStream = null;
         }
 
+        if (chunkFile != null) {
+            try {
+                Files.deleteIfExists(chunkFile);
+            } catch (IOException e) {
+                Log.w(TAG, "Could not delete incomplete transfer file", e);
+            }
+        }
+
         chunkTransferId = null;
         chunkFileSize = 0;
+        chunkExpectedFileSize = 0;
         chunkIndex = 0;
 
         finalFile = null;

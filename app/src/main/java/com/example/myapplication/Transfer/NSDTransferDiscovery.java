@@ -2,7 +2,6 @@ package com.example.myapplication.Transfer;
 
 
 import android.content.Context;
-import android.content.pm.ServiceInfo;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.net.wifi.WifiManager;
@@ -18,9 +17,9 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class NSDTransferDiscovery {
     private static final String TAG = "NSDTransferDiscovery";
+    private static final long DISCOVERY_RETRY_DELAY_MS = 2000L;
     public static final String RECIEVER_SERVICE_TYPE = "_airtransfer._tcp.";
     public static final String OFFER_SERVICE_TYPE = "_airoffer._tcp.";
-    public static final String CLAIM_SERVICE_TYPE = "_airclaim._tcp.";
 
     private final String serviceType;
 
@@ -37,20 +36,20 @@ public class NSDTransferDiscovery {
 
     public static final class Peer{
         public final String serviceName;
+        public final String deviceName;
         public final String hostAddress;
         public final int port;
-        public final String sessionId;
 
-        public Peer(String serviceName,String hostAddress,int port,String sessionId){
+        public Peer(String serviceName,String deviceName,String hostAddress,int port){
             this.serviceName = serviceName;
+            this.deviceName = deviceName;
             this.hostAddress = hostAddress;
             this.port = port;
-            this.sessionId = sessionId;
         }
 
         @Override
         public String toString(){
-            return serviceName + "(" + hostAddress + ":" + port + ":" + sessionId +")" ;
+            return deviceName + "(" + hostAddress + ":" + port +")" ;
         }
     }
 
@@ -65,11 +64,14 @@ public class NSDTransferDiscovery {
     private NsdManager.DiscoveryListener discoveryListener;
 
     private volatile boolean advertisingRequested;
+    private volatile boolean discoveryRequested;
     private boolean serviceRegistered;
     private boolean discoveryStarted;
     private String registeredServiceName;
 
     private WifiManager.MulticastLock multicastLock;
+
+    private final Runnable discoveryRetry = this::startDiscoveryInternal;
 
     public NSDTransferDiscovery(Context context, String serviceType, Listener listener){
         this.appContext = context.getApplicationContext();
@@ -81,22 +83,14 @@ public class NSDTransferDiscovery {
         }
     }
 
-    public void startAdvertising(String deviceName,int port,String sessionId){
-        startAdvertising(deviceName,port,sessionId,null,null);
+    public void startAdvertising(String deviceName,int port){
+        startAdvertising(deviceName,port,null);
     }
 
-    public void startAdvertising(String deviceName,int port,String sessionId,String fixedServiceName,AdvertisingCallback callback){
+    public void startAdvertising(String deviceName,int port,AdvertisingCallback callback){
         if(advertisingRequested){
             String reason = "An advertising is already requested";
             Log.e(TAG, reason);
-            if(callback!=null){
-                callback.onFailed(reason);
-            }
-            return;
-        }
-        if(sessionId==null || sessionId.isEmpty()){
-            String reason = "Cannot advertise without a sessionId";
-            Log.e(TAG,reason);
             if(callback!=null){
                 callback.onFailed(reason);
             }
@@ -111,20 +105,13 @@ public class NSDTransferDiscovery {
             return;
         }
         advertisingRequested = true;
-        String requestedServiceName;
-        if(fixedServiceName!=null && !fixedServiceName.trim().isEmpty()){
-            requestedServiceName = fixedServiceName;
-        }
-        else{
-            String safeName = sanitizeName(deviceName);
-            String shortSessionId = sessionId.substring(0, Math.min(8,sessionId.length()));
-            requestedServiceName = "Airtransfer-" +safeName + shortSessionId;
-        }
+        String safeName = sanitizeName(deviceName);
+        String requestedServiceName = "Airtransfer-" + safeName;
 
         NsdServiceInfo serviceInfo = new NsdServiceInfo();
         serviceInfo.setServiceName(requestedServiceName);
         serviceInfo.setServiceType(serviceType);
-        serviceInfo.setAttribute("sid",sessionId);
+        serviceInfo.setAttribute("device",sanitizeDeviceName(deviceName));
         serviceInfo.setPort(port);
 
         registrationListener = new NsdManager.RegistrationListener() {
@@ -152,17 +139,6 @@ public class NSDTransferDiscovery {
                     unregisterRegisteredService();
                     return;
                 }
-                if(fixedServiceName!=null && !fixedServiceName.equalsIgnoreCase(registeredServiceName)){
-                    advertisingRequested = false;
-                    String reason = "Sender lock is already held.NSD assigned:"+registeredServiceName;
-                    postStatus(reason);
-                    if(callback!=null){
-                        callback.onFailed(reason);
-                    } else{
-                        stopAdvertising();
-                    }
-                    return;
-                }
                 postStatus("Discoverable as:"+registeredServiceName);
                 if(callback!=null){
                     callback.onStarted(registeredServiceName);
@@ -188,8 +164,13 @@ public class NSDTransferDiscovery {
     }
 
     public void startDiscovery(){
-        if(discoveryStarted){
-            Log.e(TAG,"Discovery is already started");
+        discoveryRequested = true;
+        mainHandler.removeCallbacks(discoveryRetry);
+        startDiscoveryInternal();
+    }
+
+    private void startDiscoveryInternal() {
+        if (!discoveryRequested || discoveryStarted || discoveryListener != null) {
             return;
         }
 
@@ -200,6 +181,17 @@ public class NSDTransferDiscovery {
         NsdManager.DiscoveryListener newListener = new NsdManager.DiscoveryListener() {
             @Override
             public void onDiscoveryStarted(String s) {
+                if (!discoveryRequested) {
+                    if (discoveryListener == this) {
+                        discoveryListener = null;
+                    }
+                    try {
+                        nsdManager.stopServiceDiscovery(this);
+                    } catch (IllegalArgumentException ignored) {
+                        Log.i(TAG, "Discovery was already stopped during startup");
+                    }
+                    return;
+                }
                 discoveryStarted = true;
                 Log.i(TAG,"reciever discovery started");
                 postStatus("Discovery started..");
@@ -207,13 +199,23 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onDiscoveryStopped(String s) {
+                if (discoveryListener != null && discoveryListener != this) {
+                    return;
+                }
                 discoveryStarted = false;
+                if (discoveryListener == this) {
+                    discoveryListener = null;
+                }
                 Log.i(TAG,"reciever discovery stopped");
                 postStatus("Discovery stopped..");
+                scheduleDiscoveryRetry();
             }
 
             @Override
             public void onServiceFound(NsdServiceInfo nsdServiceInfo) {
+                if (!discoveryRequested || discoveryListener != this) {
+                    return;
+                }
                 if(!serviceType.equalsIgnoreCase(nsdServiceInfo.getServiceType())){
                     Log.i(TAG,"the discovered service type is different than the expected service type");
                     return;
@@ -235,7 +237,7 @@ public class NSDTransferDiscovery {
 
                 Log.i(TAG,"Service found");
                 postStatus("Found recievers, getting the addresses..");
-                resolveService(nsdServiceInfo);
+                resolveService(nsdServiceInfo, this);
             }
 
             @Override
@@ -250,18 +252,24 @@ public class NSDTransferDiscovery {
                 resolvingNames.remove(name);
                 Peer oldPeer = resolvedPeers.remove(name);
                 if(oldPeer!=null){
-                    postPeerLost(oldPeer);
+                    postPeerLost(oldPeer, this);
                 }
 
             }
 
             @Override
             public void onStartDiscoveryFailed(String s, int i) {
+                if (discoveryListener != null && discoveryListener != this) {
+                    return;
+                }
                 discoveryStarted = false;
-                discoveryListener = null;
+                if (discoveryListener == this) {
+                    discoveryListener = null;
+                }
                 releaseMulticastLock();
                 Log.e(TAG,"Could not start the reciever discovery");
                 postError("Could not start discovery",i);
+                scheduleDiscoveryRetry();
             }
 
             @Override
@@ -273,11 +281,30 @@ public class NSDTransferDiscovery {
 
         discoveryListener = newListener;
 
-        nsdManager.discoverServices(serviceType,NsdManager.PROTOCOL_DNS_SD,discoveryListener);
+        try {
+            nsdManager.discoverServices(serviceType,NsdManager.PROTOCOL_DNS_SD,discoveryListener);
+        } catch (RuntimeException error) {
+            discoveryListener = null;
+            discoveryStarted = false;
+            releaseMulticastLock();
+            Log.e(TAG, "Could not request service discovery", error);
+            postError("Could not start discovery", -1);
+            scheduleDiscoveryRetry();
+        }
+    }
+
+    private void scheduleDiscoveryRetry() {
+        if (discoveryRequested) {
+            mainHandler.removeCallbacks(discoveryRetry);
+            mainHandler.postDelayed(discoveryRetry, DISCOVERY_RETRY_DELAY_MS);
+        }
     }
 
     @SuppressWarnings("deprecation")
-    private void resolveService(NsdServiceInfo discoveredserviceInfo){
+    private void resolveService(
+            NsdServiceInfo discoveredserviceInfo,
+            NsdManager.DiscoveryListener sourceListener
+    ){
         nsdManager.resolveService(discoveredserviceInfo,
                 new NsdManager.ResolveListener() {
                     @Override
@@ -290,12 +317,16 @@ public class NSDTransferDiscovery {
                     public void onServiceResolved(NsdServiceInfo nsdServiceInfo) {
                         String name = nsdServiceInfo.getServiceName();
                         resolvingNames.remove(name);
-                        byte[] sidBytes = nsdServiceInfo.getAttributes().get("sid");
+                        Map<String, byte[]> attributes = nsdServiceInfo.getAttributes();
+                        byte[] deviceBytes = attributes == null ? null : attributes.get("device");
 
-                        String sessionId = sidBytes ==  null? null :
-                                new String(sidBytes,StandardCharsets.UTF_8);
+                        String deviceName = deviceBytes == null ? null :
+                                new String(deviceBytes, StandardCharsets.UTF_8);
+                        if (deviceName == null || deviceName.trim().isEmpty()) {
+                            deviceName = name;
+                        }
 
-                        if(discoveryListener == null || name == null || sessionId == null){
+                        if(discoveryListener != sourceListener || name == null){
                             return;
                         }
 
@@ -311,22 +342,24 @@ public class NSDTransferDiscovery {
                                 + " address=" + host.getHostAddress()
                                 + " port=" + port);
 
-                        Peer peer = new Peer(name,host.getHostAddress(),port,sessionId);
+                        Peer peer = new Peer(name,deviceName,host.getHostAddress(),port);
                         resolvedPeers.put(name,peer);
                         Log.i(TAG,"Peer found");
-                        postPeerFound(peer);
+                        postPeerFound(peer, sourceListener);
                     }
                 });
     }
 
     public void stopDiscovery(){
+        discoveryRequested = false;
+        mainHandler.removeCallbacks(discoveryRetry);
         NsdManager.DiscoveryListener oldListener = discoveryListener;
         discoveryListener = null;
 
         resolvingNames.clear();
         resolvedPeers.clear();
 
-        if(oldListener!=null && discoveryStarted){
+        if(oldListener!=null){
             try{
                 nsdManager.stopServiceDiscovery(oldListener);
             } catch(IllegalArgumentException e){
@@ -381,6 +414,17 @@ public class NSDTransferDiscovery {
 
     }
 
+    private String sanitizeDeviceName(String deviceName) {
+        if (deviceName == null || deviceName.trim().isEmpty()) {
+            return "Android";
+        }
+        String safeName = deviceName.trim().replaceAll("[^A-Za-z0-9 _.-]", "");
+        if (safeName.isEmpty()) {
+            return "Android";
+        }
+        return safeName.length() > 80 ? safeName.substring(0, 80) : safeName;
+    }
+
     private void unregisterRegisteredService(){
         if(registrationListener == null || !serviceRegistered){
             return;
@@ -400,15 +444,23 @@ public class NSDTransferDiscovery {
         }
     }
 
-    private void postPeerFound(Peer peer){
+    private void postPeerFound(Peer peer, NsdManager.DiscoveryListener sourceListener){
         if(listener != null){
-            mainHandler.post(()->listener.onPeerFound(peer));
+            mainHandler.post(()->{
+                if (discoveryListener == sourceListener) {
+                    listener.onPeerFound(peer);
+                }
+            });
         }
     }
 
-    private void postPeerLost(Peer peer){
+    private void postPeerLost(Peer peer, NsdManager.DiscoveryListener sourceListener){
         if(listener != null){
-            mainHandler.post(()->listener.onPeerLost(peer));
+            mainHandler.post(()->{
+                if (discoveryListener == sourceListener) {
+                    listener.onPeerLost(peer);
+                }
+            });
         }
     }
 

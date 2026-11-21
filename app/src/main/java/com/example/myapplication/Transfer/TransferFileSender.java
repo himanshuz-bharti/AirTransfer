@@ -32,6 +32,7 @@ public class TransferFileSender {
 
 
     public interface TransferCallback{
+        void onProgress(long bytesSent,long totalBytes);
         void onSuccess();
         void onFailure(Exception e);
     }
@@ -57,7 +58,7 @@ public class TransferFileSender {
 
         executor.execute(()->{
             try{
-                doSendFile(resolver,uri);
+                doSendFile(resolver,uri,callback);
                 if(callback != null){
                     callback.onSuccess();
                 }
@@ -71,6 +72,14 @@ public class TransferFileSender {
     }
 
     void doSendFile(ContentResolver resolver,Uri uri) throws Exception{
+        doSendFile(resolver,uri,null);
+    }
+
+    private void doSendFile(
+            ContentResolver resolver,
+            Uri uri,
+            @Nullable TransferCallback callback
+    ) throws Exception {
         Log.i(TAG,"File Sender dosendfile called");
         if(!isOpen()){
             throw new IllegalArgumentException("websocket is not connected");
@@ -86,11 +95,17 @@ public class TransferFileSender {
         }
 
         String transferId = TransferFileMetadata.newtransferId();
-        startTransfer(resolver,uri,filename,fileSize,transferId);
+        startTransfer(resolver,uri,filename,fileSize,transferId,callback);
     }
 
-    private void startTransfer(ContentResolver resolver, Uri uri, String filename,Long fileSize,String transferId)
-    throws Exception{
+    private void startTransfer(
+            ContentResolver resolver,
+            Uri uri,
+            String filename,
+            Long fileSize,
+            String transferId,
+            @Nullable TransferCallback callback
+    ) throws Exception {
 
         Log.i(TAG,"Start transfer called");
         String encodedName = encodeFilename(filename);
@@ -127,6 +142,9 @@ public class TransferFileSender {
 
                 totalsent += read;
                 chunkidx += 1;
+                if (callback != null) {
+                    callback.onProgress(totalsent, fileSize);
+                }
             }
         }
         if(totalsent != fileSize){
