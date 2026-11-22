@@ -167,6 +167,7 @@ public class TransferEffectOverlay {
     private final WindowManager windowManager;
     private BorderView view;
     private boolean attached;
+    private long animationGeneration;
 
     public TransferEffectOverlay(Context context){
         this.context = context.getApplicationContext();
@@ -174,6 +175,7 @@ public class TransferEffectOverlay {
     }
 
     public void show(Phase phase){
+        animationGeneration++;
         if(windowManager == null || !Settings.canDrawOverlays(context)){
             Log.w(TAG,"windowmanager is null or overlay permission is not given");
             return;
@@ -210,10 +212,17 @@ public class TransferEffectOverlay {
         if(!attached || view == null){
             return;
         }
-        view.finish(success,this::remove);
+        long finishGeneration = ++animationGeneration;
+        BorderView finishingView = view;
+        view.finish(success, () -> {
+            if (view == finishingView && animationGeneration == finishGeneration) {
+                remove();
+            }
+        });
     }
 
     public void remove(){
+        animationGeneration++;
         if(view!=null){
             view.stopAnimation();
         }

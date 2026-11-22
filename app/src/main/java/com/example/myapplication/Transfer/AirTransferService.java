@@ -45,6 +45,7 @@ import androidx.lifecycle.LifecycleService;
 import com.example.myapplication.RecieveImageActivity;
 import com.example.myapplication.ui.GestureDebugOverlay;
 import com.example.myapplication.ui.TransferEffectOverlay;
+import com.example.myapplication.ui.ReceiverStatusOverlay;
 import com.example.myapplication.vision.HandGestureController;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.mediapipe.framework.image.BitmapImageBuilder;
@@ -69,7 +70,8 @@ public class AirTransferService extends LifecycleService {
 
     private static final int RECIEVER_PORT = 8080;
     private static final long SENDER_TIMEOUT_MS = 120000L;
-    private static final long SENDER_NO_RECEIVER_TIMEOUT_MS = 30000L;
+    private static final long SENDER_MATCH_TIMEOUT_MS = 300000L;
+    private static final long SENDER_NO_RECEIVER_TIMEOUT_MS = 90000L;
     private static final long RECIEVER_TIMEOUT_MS = 60000L;
     private static final long RECIEVER_TRANSFER_IDLE_TIMEOUT_MS = 180000L;
     private static final long GESTURE_FRAME_INTERVAL_MS = 200L;
@@ -78,6 +80,7 @@ public class AirTransferService extends LifecycleService {
     private RoleState roleState = RoleState.IDLE;
 
     private TransferEffectOverlay transferEffectOverlay;
+    private ReceiverStatusOverlay receiverStatusOverlay;
     private GestureDebugOverlay gestureDebugOverlay;
     private static final String OFFER_SERVICE_TYPE = NSDTransferDiscovery.OFFER_SERVICE_TYPE;
     private static final String RECIEVER_SERVICE_TYPE = NSDTransferDiscovery.RECIEVER_SERVICE_TYPE;
@@ -114,7 +117,7 @@ public class AirTransferService extends LifecycleService {
     private final ExecutorService galleryMatchExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService wsExecutor = Executors.newSingleThreadExecutor();
 
-    private TransferWebSocketClient webSocketClient;
+    private volatile TransferWebSocketClient webSocketClient;
     private TransferFileSender fileSender;
     private ProcessCameraProvider cameraProvider;
     private ImageAnalysis imageAnalysis;
@@ -127,12 +130,21 @@ public class AirTransferService extends LifecycleService {
 
     private boolean stopping;
     private boolean startAccepted;
+    private volatile long operationGeneration;
+    private volatile long captureRequestGeneration;
+    private long senderDeadlineAtMs;
     private boolean networkResourcesReleased;
 
-    private final Runnable senderTimeout = () ->{
-        if(isSenderState()){
-            finishSenderAttempt("Sender operation timed out");
+    private final Runnable senderTimeout = () -> {
+        if (!isSenderState()) {
+            return;
         }
+        long remainingMs = senderDeadlineAtMs - SystemClock.elapsedRealtime();
+        if (remainingMs > 0L) {
+            mainHandler.postDelayed(AirTransferService.this.senderTimeout, remainingMs);
+            return;
+        }
+        finishSenderAttempt("Sender operation timed out");
     };
 
     private final Runnable receiverStartupTimeout = () -> {
@@ -157,6 +169,7 @@ public class AirTransferService extends LifecycleService {
     public void onCreate(){
         super.onCreate();
         transferEffectOverlay = new TransferEffectOverlay(this);
+        receiverStatusOverlay = new ReceiverStatusOverlay(this);
         gestureDebugOverlay = new GestureDebugOverlay(this);
         createNotificationChannel();
         initializeNSD();
@@ -371,6 +384,10 @@ public class AirTransferService extends LifecycleService {
             return;
         }
         Log.i(TAG, "Accepted gesture action=" + action + "; role=" + roleState);
+        if (roleState != RoleState.IDLE) {
+            Log.w(TAG, "Ignoring gesture action while transfer role is active: " + roleState);
+            return;
+        }
         pauseGestureCamera();
         if (action == HandGestureController.Action.SEND) {
             startSenderMode();
@@ -558,6 +575,11 @@ public class AirTransferService extends LifecycleService {
             return;
         }
 
+        operationGeneration++;
+        final long senderGeneration = operationGeneration;
+        if (receiverStatusOverlay != null) {
+            receiverStatusOverlay.remove();
+        }
         roleState = RoleState.SENDER_ADVERTISING;
         pendingItemUri = null;
         pendingReciever = null;
@@ -566,15 +588,15 @@ public class AirTransferService extends LifecycleService {
         setTransferStatus("Preparing image capture");
         showPeerStatus("No receiver found yet");
 
-        mainHandler.removeCallbacks(senderTimeout);
-        mainHandler.postDelayed(senderTimeout,SENDER_TIMEOUT_MS);
+        scheduleSenderTimeout(SENDER_MATCH_TIMEOUT_MS);
 
         offerNsd.startAdvertising(Build.MODEL, RECIEVER_PORT,
                 new NSDTransferDiscovery.AdvertisingCallback() {
                     @Override
                     public void onStarted(String actualServiceName) {
                         mainHandler.post(()->{
-                            if(stopping || roleState != RoleState.SENDER_ADVERTISING){
+                            if (operationGeneration != senderGeneration
+                                    || stopping || roleState != RoleState.SENDER_ADVERTISING){
                                 offerNsd.stopAdvertising();
                                 return;
                             }
@@ -594,7 +616,8 @@ public class AirTransferService extends LifecycleService {
                     @Override
                     public void onFailed(String reason) {
                         mainHandler.post(()->{
-                            if(roleState == RoleState.SENDER_ADVERTISING){
+                            if (operationGeneration == senderGeneration
+                                    && roleState == RoleState.SENDER_ADVERTISING){
                                 finishSenderAttempt("Could not advertise sender offer: " + reason);
                             }
                         });
@@ -620,7 +643,11 @@ public class AirTransferService extends LifecycleService {
 
         mainHandler.removeCallbacks(receiverStartupTimeout);
         receiverTransferCompleted.set(false);
+        operationGeneration++;
 
+        if (transferEffectOverlay != null) {
+            transferEffectOverlay.remove();
+        }
         roleState = RoleState.RECIEVER_STARTING;
         connectedSenderHost = null;
         connectedSenderIdentity = null;
@@ -628,9 +655,11 @@ public class AirTransferService extends LifecycleService {
         setConnectionStatus("Waiting for WebSocket connection");
         setTransferStatus("Idle");
         showPeerStatus("Starting receiver; waiting for sender");
+        receiverStatusOverlay.show(ReceiverStatusOverlay.State.STARTING);
         showStatus("Starting receiver");
 
         mainHandler.postDelayed(receiverStartupTimeout, RECIEVER_TIMEOUT_MS);
+        scheduleReceiverTransferIdleTimeout(null, "Receiver timed out waiting for sender");
 
         File temporaryDirectory = new File(getCacheDir(),"recieved-parts");
         TransferWebSocketServer server = new TransferWebSocketServer(getApplicationContext(),
@@ -677,6 +706,7 @@ public class AirTransferService extends LifecycleService {
                     setDiscoveryStatus("Sender connected");
                     setConnectionStatus("WebSocket connected");
                     setTransferStatus("Receiving image");
+                    receiverStatusOverlay.show(ReceiverStatusOverlay.State.RECEIVING);
                     showPeerStatus("WebSocket connected: " + senderIdentity);
                     showStatus("Connected to " + senderIdentity);
                     scheduleReceiverTransferIdleTimeout(server,
@@ -743,6 +773,7 @@ public class AirTransferService extends LifecycleService {
                                                 + actualServiceName);
                                         return;
                                     }
+                                    receiverStatusOverlay.show(ReceiverStatusOverlay.State.READY);
                                     boolean senderNearby = !visibleSenderOffers.isEmpty();
                                     setDiscoveryStatus(senderNearby
                                             ? "Receiver advertised; sender nearby"
@@ -793,6 +824,12 @@ public class AirTransferService extends LifecycleService {
 
         startActivity(viewIntent);
     }
+    private void scheduleSenderTimeout(long timeoutMs) {
+        senderDeadlineAtMs = SystemClock.elapsedRealtime() + timeoutMs;
+        mainHandler.removeCallbacks(senderTimeout);
+        mainHandler.postDelayed(senderTimeout, timeoutMs);
+    }
+
     private void scheduleReceiverTransferIdleTimeout(
             TransferWebSocketServer server,
             String timeoutMessage
@@ -801,8 +838,15 @@ public class AirTransferService extends LifecycleService {
             mainHandler.removeCallbacks(receiverIdleTimeout);
         }
 
-        receiverIdleTimeout = ()->{
-            if(recieverServer == server && roleState == RoleState.RECIEVER_LISTENING){
+        receiverIdleTimeout = () -> {
+            boolean waitingForConnection = server == null
+                    && recieverServer != null
+                    && roleState == RoleState.RECIEVER_LISTENING
+                    && connectedSenderHost == null;
+            boolean matchingServer = server != null
+                    && recieverServer == server
+                    && roleState == RoleState.RECIEVER_LISTENING;
+            if (waitingForConnection || matchingServer) {
                 finishReceiverOperation(timeoutMessage);
             }
         };
@@ -815,6 +859,9 @@ public class AirTransferService extends LifecycleService {
             return;
         }
         boolean transferSucceeded = receiverTransferCompleted.get();
+        if (receiverStatusOverlay != null) {
+            receiverStatusOverlay.finish(transferSucceeded);
+        }
 
         mainHandler.removeCallbacks(receiverStartupTimeout);
         if(receiverIdleTimeout != null){
@@ -822,6 +869,7 @@ public class AirTransferService extends LifecycleService {
             receiverIdleTimeout = null;
         }
 
+        operationGeneration++;
         roleState = RoleState.IDLE;
         if(recieverServer!=null){
             try{
@@ -844,8 +892,9 @@ public class AirTransferService extends LifecycleService {
         receiverTransferCompleted.set(false);
         setDiscoveryStatus("Idle");
         setConnectionStatus("Disconnected");
-        setTransferStatus(transferSucceeded ? "Received successfully" : "Failed or stopped");
+        setTransferStatus("Idle");
         showPeerStatus("No peer connected");
+        setOverlayOperationStatus("Ready for gesture");
         showStatus(message);
         resumeGestureCamera();
     }
@@ -1031,6 +1080,7 @@ public class AirTransferService extends LifecycleService {
             return false;
         }
 
+        captureRequestGeneration = operationGeneration;
         capturePending.set(true);
         return true;
     }
@@ -1038,6 +1088,7 @@ public class AirTransferService extends LifecycleService {
     private void onImageAvailable(ImageReader reader){
         Image image = null;
         Bitmap bitmap = null;
+        long requestGeneration = 0L;
         try{
             image = reader.acquireLatestImage();
             if(image == null){
@@ -1054,18 +1105,27 @@ public class AirTransferService extends LifecycleService {
                 Log.i(TAG,"capturePending compare and set");
                 return;
             }
+            requestGeneration = captureRequestGeneration;
 
             bitmap = imageToBitmap(image);
 
             if(bitmap == null){
                 Log.i(TAG,"Error in converting from image to bitmap");
-                mainHandler.post(() ->
-                        finishSenderAttempt("Could not convert screen capture."));
+                long failedGeneration = requestGeneration;
+                mainHandler.post(() -> {
+                    if (operationGeneration == failedGeneration) {
+                        finishSenderAttempt("Could not convert screen capture.");
+                    }
+                });
                 return;
             }
 
             Bitmap bitmapForMatching = bitmap.copy(Bitmap.Config.ARGB_8888,false);
-            mainHandler.post(()->{
+            long capturedGeneration = requestGeneration;
+            mainHandler.post(() -> {
+                if (operationGeneration != capturedGeneration) {
+                    return;
+                }
                 transferEffectOverlay.show(TransferEffectOverlay.Phase.CAPTURED);
                 setTransferStatus("Screen captured; matching Gallery");
                 setOverlayOperationStatus("Matching captured screen against Gallery");
@@ -1074,6 +1134,7 @@ public class AirTransferService extends LifecycleService {
             if (bitmapForMatching == null) {
                 throw new IllegalStateException("Could not copy captured bitmap for matching.");
             }
+            final long matchGeneration = requestGeneration;
             galleryMatchExecutor.execute(()->{
                 try{
                     GalleryImageMatcher.MatchResult matchResult = GalleryImageMatcher.findBestMatch(
@@ -1084,8 +1145,11 @@ public class AirTransferService extends LifecycleService {
                         Log.i(TAG,"No matching candidate was found. Images checked:"+
                                 matchResult.galleryImagesChecked);
 
-                        mainHandler.post(() ->
-                                finishSenderAttempt("No gallery image match was found."));
+                        mainHandler.post(() -> {
+                            if (operationGeneration == matchGeneration) {
+                                finishSenderAttempt("No gallery image match was found.");
+                            }
+                        });
                         return;
                     }
 
@@ -1097,22 +1161,35 @@ public class AirTransferService extends LifecycleService {
                     String message = (matchResult.Confident?"Gallery match: ":"Possible match: ")
                             + matchResult.bestDisplayName;
 
-                    mainHandler.post(()->{
+                    mainHandler.post(() -> {
+                        if (operationGeneration != matchGeneration) {
+                            return;
+                        }
                         setTransferStatus("Checking Gallery match");
                         setOverlayOperationStatus(message);
                         Toast.makeText(getApplicationContext(),message,Toast.LENGTH_SHORT).show();
                     });
                     if(!matchResult.Confident) {
-                        mainHandler.post(() ->
-                                finishSenderAttempt("No confident gallery match was found."));
+                        mainHandler.post(() -> {
+                            if (operationGeneration == matchGeneration) {
+                                finishSenderAttempt("No confident gallery match was found.");
+                            }
+                        });
                         return;
                     }
                     Uri matchedUri = matchResult.bestUri;
-                    mainHandler.post(()->onGalleryMatchReady(matchedUri));
+                    mainHandler.post(() -> {
+                        if (operationGeneration == matchGeneration) {
+                            onGalleryMatchReady(matchedUri);
+                        }
+                    });
                 }catch(Exception e){
                     Log.e(TAG,"Gallery matching failed",e);
-                    mainHandler.post(() ->
-                            finishSenderAttempt("Gallery matching failed."));
+                    mainHandler.post(() -> {
+                        if (operationGeneration == matchGeneration) {
+                            finishSenderAttempt("Gallery matching failed.");
+                        }
+                    });
                 } finally{
                     if(bitmapForMatching!=null && !bitmapForMatching.isRecycled()){
                         bitmapForMatching.recycle();
@@ -1121,15 +1198,20 @@ public class AirTransferService extends LifecycleService {
             });
 
             bitmap = null;
-            mainHandler.post(()->{
-                Toast.makeText(this,"Screen captured; matching Gallery image.",Toast.LENGTH_SHORT).show();
+            mainHandler.post(() -> {
+                if (operationGeneration == capturedGeneration) {
+                    Toast.makeText(this,"Screen captured; matching Gallery image.",Toast.LENGTH_SHORT).show();
+                }
             });
         } catch(Exception e){
             Log.e(TAG,"Could not captrue and save image",e);
             capturePending.set(false);
 
-            mainHandler.post(()->{
-                finishSenderAttempt("Screen capture failed.");
+            long failedGeneration = requestGeneration;
+            mainHandler.post(() -> {
+                if (operationGeneration == failedGeneration) {
+                    finishSenderAttempt("Screen capture failed.");
+                }
             });
         } finally{
             if(bitmap!=null && !bitmap.isRecycled()){
@@ -1169,11 +1251,10 @@ public class AirTransferService extends LifecycleService {
         setOverlayOperationStatus(pendingReciever == null
                 ? "Image matched; waiting for receiver"
                 : "Image matched; connecting to receiver");
-        // Capture and matching use the initial sender timeout. Start a fresh
-        // discovery window once the image is ready, even if NSD found a peer
-        // earlier, so a slow match cannot leave only a few seconds to connect.
-        mainHandler.removeCallbacks(senderTimeout);
-        mainHandler.postDelayed(senderTimeout, SENDER_NO_RECEIVER_TIMEOUT_MS);
+        // Matching has its own deadline. Once the image is ready, allow a full
+        // receiver-discovery window even if NSD found a peer earlier, then use
+        // a separate connection/transfer deadline.
+        scheduleSenderTimeout(SENDER_NO_RECEIVER_TIMEOUT_MS);
         maybeConnectToReciever();
     }
 
@@ -1202,6 +1283,7 @@ public class AirTransferService extends LifecycleService {
         recieverNsd.stopDiscovery();
 
         roleState = RoleState.SENDER_CONNECTING;
+        scheduleSenderTimeout(SENDER_TIMEOUT_MS);
         setDiscoveryStatus("Receiver selected");
         setConnectionStatus("Connecting to receiver");
 
@@ -1302,11 +1384,10 @@ public class AirTransferService extends LifecycleService {
             finishSenderAttempt("Sender was not ready after connection");
             return;
         }
-        mainHandler.removeCallbacks(senderTimeout);
-        // The discovery/capture timeout has ended. Give the actual socket send
-        // its own bounded interval so a stalled transfer cannot leave the
+        // The discovery/matching deadline has ended. Give the actual socket
+        // send its own bounded interval so a stalled transfer cannot leave the
         // sender operation active indefinitely.
-        mainHandler.postDelayed(senderTimeout, SENDER_TIMEOUT_MS);
+        scheduleSenderTimeout(SENDER_TIMEOUT_MS);
         roleState = RoleState.SENDER_SENDING;
 
         transferEffectOverlay.show(TransferEffectOverlay.Phase.SENDING);
@@ -1324,8 +1405,7 @@ public class AirTransferService extends LifecycleService {
                                 int percent = totalBytes <= 0 ? 0 : (int) Math.min(100L,
                                         (bytesSent * 100L) / totalBytes);
                                 setTransferStatus("Sending image " + percent + "%");
-                                mainHandler.removeCallbacks(senderTimeout);
-                                mainHandler.postDelayed(senderTimeout, SENDER_TIMEOUT_MS);
+                                scheduleSenderTimeout(SENDER_TIMEOUT_MS);
                             }
                         });
                     }
@@ -1401,6 +1481,10 @@ public class AirTransferService extends LifecycleService {
 
         if(transferEffectOverlay!=null){
             transferEffectOverlay.remove();
+        }
+        if (receiverStatusOverlay != null) {
+            receiverStatusOverlay.remove();
+            receiverStatusOverlay = null;
         }
         if (gestureDebugOverlay != null) {
             gestureDebugOverlay.remove();
@@ -1499,6 +1583,8 @@ public class AirTransferService extends LifecycleService {
         Log.i(TAG, "Finishing sender attempt: " + message
                 + "; retaining MediaProjection=" + (mediaProjection != null));
 
+        operationGeneration++;
+        senderDeadlineAtMs = 0L;
         mainHandler.removeCallbacks(senderTimeout);
         capturePending.set(false);
 
@@ -1526,8 +1612,9 @@ public class AirTransferService extends LifecycleService {
         roleState = RoleState.IDLE;
         setDiscoveryStatus("Idle");
         setConnectionStatus("Disconnected");
-        setTransferStatus(success ? "Sent successfully" : "Failed or stopped");
+        setTransferStatus("Idle");
         showPeerStatus("No peer connected");
+        setOverlayOperationStatus("Ready for gesture");
         showStatus(message);
         resumeGestureCamera();
     }
@@ -1544,7 +1631,9 @@ public class AirTransferService extends LifecycleService {
             receiverIdleTimeout = null;
         }
         capturePending.set(false);
+        operationGeneration++;
         roleState = RoleState.IDLE;
+        senderDeadlineAtMs = 0L;
         pendingItemUri = null;
         pendingReciever = null;
         connectedSenderHost = null;
@@ -1555,6 +1644,9 @@ public class AirTransferService extends LifecycleService {
         setConnectionStatus("Disconnected");
         setTransferStatus("Idle");
         showPeerStatus("No peer connected");
+        if (receiverStatusOverlay != null) {
+            receiverStatusOverlay.remove();
+        }
         if (offerNsd != null) {
             offerNsd.stopAll();
         }

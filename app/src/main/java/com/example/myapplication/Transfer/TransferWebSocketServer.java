@@ -38,6 +38,7 @@ public class TransferWebSocketServer extends WebSocketServer{
     private final Context appContext;
 
     private OutputStream outputStream;
+    private volatile WebSocket activeConnection;
 
     private String chunkTransferId;
     private long chunkFileSize;
@@ -68,10 +69,16 @@ public class TransferWebSocketServer extends WebSocketServer{
     }
 
     @Override
-    public void onOpen(WebSocket conn,ClientHandshake handshake){
+    public synchronized void onOpen(WebSocket conn,ClientHandshake handshake){
         String remoteHost = remoteHost(conn);
         int remotePort = remotePort(conn);
         Log.i(TAG,"Websocket client connected " + remoteHost + ":" + remotePort);
+        if (activeConnection != null && activeConnection != conn) {
+            Log.w(TAG, "Rejecting additional WebSocket client while a transfer session is active");
+            conn.close(1008, "Receiver is already in use");
+            return;
+        }
+        activeConnection = conn;
         if (clientConnectionListener != null) {
             clientConnectionListener.onConnected(remoteHost, remotePort);
         }
@@ -79,6 +86,10 @@ public class TransferWebSocketServer extends WebSocketServer{
 
     @Override
     public void onMessage(WebSocket conn,String message){
+        if (conn != activeConnection) {
+            conn.close(1008, "Not the active transfer session");
+            return;
+        }
         Log.i(TAG,"Recieved message from:"+conn.getRemoteSocketAddress()+
                 "of size:" + message.length());
 
@@ -111,6 +122,10 @@ public class TransferWebSocketServer extends WebSocketServer{
 
     @Override
     public void onMessage(WebSocket conn, ByteBuffer message){
+        if (conn != activeConnection) {
+            conn.close(1008, "Not the active transfer session");
+            return;
+        }
         Log.i(TAG,"Recieved binary message from:"+conn.getRemoteSocketAddress()+
                 "of size:" + message.remaining());
 
@@ -124,6 +139,9 @@ public class TransferWebSocketServer extends WebSocketServer{
 
             if(chunkFileSize + data.length > MAX_FILE_SIZE){
                 throw new IOException("File size exceeded the maximum limit");
+            }
+            if(chunkFileSize + data.length > chunkExpectedFileSize){
+                throw new IOException("Received more data than the declared file size");
             }
 
             outputStream.write(data);
@@ -147,15 +165,21 @@ public class TransferWebSocketServer extends WebSocketServer{
     @Override
     public void onClose(WebSocket conn,int code,String reason,boolean remote){
         Log.i(TAG,"websocket disconnected");
-        abortTransfer();
-        notifyClientDisconnected(conn);
+        if (conn == activeConnection) {
+            activeConnection = null;
+            abortTransfer();
+            notifyClientDisconnected(conn);
+        }
     }
 
     @Override
     public void onError(WebSocket conn,Exception e){
         Log.e(TAG,"Websocket error:"+e.getMessage());
-        abortTransfer();
-        notifyClientDisconnected(conn);
+        if (conn == activeConnection) {
+            activeConnection = null;
+            abortTransfer();
+            notifyClientDisconnected(conn);
+        }
         e.printStackTrace();
     }
 
@@ -221,7 +245,7 @@ public class TransferWebSocketServer extends WebSocketServer{
                 throw new IOException("Invalid start message size");
             }
 
-            if(outputStream != null){
+            if(chunkTransferId != null || outputStream != null){
                 throw new IOException("outputstream is not null. A transfer already in progress");
             }
 
@@ -238,7 +262,7 @@ public class TransferWebSocketServer extends WebSocketServer{
 
             TransferFileMetadata fileMetaData = new TransferFileMetadata(encodedName, expectedFileSize, "image/jpg", transferId);
 
-            if(!fileMetaData.validFileSize(MAX_FILE_SIZE)){
+            if(!fileMetaData.validFileSize(MAX_FILE_SIZE) || expectedFileSize == 0L){
                 throw new IOException("Invalid file size");
             }
 
@@ -280,11 +304,11 @@ public class TransferWebSocketServer extends WebSocketServer{
             String id = parts[1];
             Long finalSize = Long.parseLong(parts[2]);
 
-            if(!chunkTransferId.equals(id)){
+            if(chunkTransferId == null || !chunkTransferId.equals(id)){
                 throw new IOException("Invalid transfer ID");
             }
 
-            if(chunkFileSize != finalSize){
+            if(chunkFileSize != finalSize || chunkFileSize != chunkExpectedFileSize){
                 throw new IOException("Size mismatch");
             }
 
