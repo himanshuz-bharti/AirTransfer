@@ -7,6 +7,7 @@ import android.net.nsd.NsdServiceInfo;
 import android.net.wifi.WifiManager;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.net.InetAddress;
@@ -64,6 +65,14 @@ public class NSDTransferDiscovery {
     private final Map<String,Peer> resolvedPeers = new ConcurrentHashMap<>();
     private final Set<String> resolvingNames = ConcurrentHashMap.newKeySet();
 
+    private static final int MAX_REGISTRATION_ATTEMPTS = 3;
+    private static final long REGISTRATION_RETRY_DELAY_MS = 700L;
+    private static final int MAX_UNREGISTRATION_ATTEMPTS = 3;
+    private static final long UNREGISTRATION_RETRY_DELAY_MS = 700L;
+    private static final int MAX_DISCOVERY_STOP_ATTEMPTS = 3;
+    private static final int MAX_RESOLVE_ATTEMPTS = 3;
+    private static final long RESOLVE_RETRY_DELAY_MS = 600L;
+
     private NsdManager.RegistrationListener registrationListener;
     private NsdManager.DiscoveryListener discoveryListener;
 
@@ -73,6 +82,24 @@ public class NSDTransferDiscovery {
     private boolean unregistrationRequested;
     private boolean discoveryStarted;
     private String registeredServiceName;
+
+    // Tracks NSD teardown work that the platform acknowledges asynchronously
+    // (unregisterService / stopServiceDiscovery). A session must not end, and a new
+    // session must not re-register the same service types, before these operations
+    // have been acknowledged; unregistering and re-registering the same service type
+    // back-to-back otherwise breaks announcements on several Android NSD stacks and
+    // peers stop discovering the re-advertised service.
+    private final Object teardownMonitor = new Object();
+    private int pendingTeardownOperations;
+    private final Set<NsdManager.RegistrationListener> pendingUnregistrations =
+            ConcurrentHashMap.newKeySet();
+    private final Set<NsdManager.DiscoveryListener> pendingDiscoveryStops =
+            ConcurrentHashMap.newKeySet();
+    private boolean discoveryStartPending;
+    private boolean discoveryStopDeferredUntilStart;
+    private int registrationAttempts;
+    private int unregistrationAttempts;
+    private int discoveryStopAttempts;
 
     private WifiManager.MulticastLock multicastLock;
 
@@ -110,6 +137,11 @@ public class NSDTransferDiscovery {
             return;
         }
         advertisingRequested = true;
+        registrationAttempts = 0;
+        registerAdvertisementAttempt(deviceName, port, callback);
+    }
+
+    private void registerAdvertisementAttempt(String deviceName, int port, AdvertisingCallback callback) {
         String safeName = sanitizeName(deviceName);
         String advertisementId = UUID.randomUUID().toString().substring(0, 8);
         String requestedServiceName = "Airtransfer-" + safeName + "-" + advertisementId;
@@ -128,12 +160,9 @@ public class NSDTransferDiscovery {
                     return;
                 }
                 serviceRegistered = false;
-                advertisingRequested = false;
-                String reason = "Registration advertisement failed" + i;
-                postError("Registration advertisement failed", i);
-                if(callback!=null){
-                    callback.onFailed(reason);
-                }
+                registrationListener = null;
+                handleRegistrationFailure(deviceName, port, callback, i,
+                        "Registration advertisement failed " + i);
             }
 
             @Override
@@ -149,6 +178,8 @@ public class NSDTransferDiscovery {
                 }
                 serviceRegistered = true;
                 unregistrationRequested = false;
+                unregistrationAttempts = 0;
+                registrationAttempts = 0;
                 registeredServiceName = nsdServiceInfo.getServiceName();
 
                 Log.i(TAG, "NSD_ADVERTISED name=" + registeredServiceName
@@ -167,18 +198,36 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onServiceUnregistered(NsdServiceInfo nsdServiceInfo) {
+                completeUnregistrationTeardown(this);
                 if (registrationListener != this) {
                     return;
                 }
                 serviceRegistered = false;
                 unregistrationRequested = false;
+                unregistrationAttempts = 0;
                 registeredServiceName = null;
                 postStatus("Service is no longer discoverable");
             }
 
             @Override
             public void onUnregistrationFailed(NsdServiceInfo nsdServiceInfo, int i) {
+                completeUnregistrationTeardown(this);
                 if (registrationListener != this) {
+                    return;
+                }
+                Log.w(TAG, "Service unregistration failed. Error code " + i);
+                if (unregistrationAttempts < MAX_UNREGISTRATION_ATTEMPTS) {
+                    // The platform rejected the unregistration; the advertisement is
+                    // most likely still active. Retry before giving up so the next
+                    // session cannot collide with a still-registered service.
+                    serviceRegistered = true;
+                    unregistrationRequested = false;
+                    final NsdManager.RegistrationListener currentListener = this;
+                    mainHandler.postDelayed(() -> {
+                        if (registrationListener == currentListener && serviceRegistered) {
+                            unregisterRegisteredService();
+                        }
+                    }, UNREGISTRATION_RETRY_DELAY_MS);
                     return;
                 }
                 serviceRegistered = true;
@@ -188,15 +237,40 @@ public class NSDTransferDiscovery {
         };
 
         try {
+            registrationAttempts++;
             nsdManager.registerService(serviceInfo,NsdManager.PROTOCOL_DNS_SD,registrationListener);
         } catch (RuntimeException error) {
-            advertisingRequested = false;
-            registrationListener = null;
             Log.e(TAG, "Could not request service registration", error);
-            if (callback != null) {
-                callback.onFailed("Could not request service registration: "
-                        + error.getMessage());
-            }
+            registrationListener = null;
+            handleRegistrationFailure(deviceName, port, callback, -1,
+                    "Could not request service registration: " + error.getMessage());
+        }
+    }
+
+    private void handleRegistrationFailure(
+            String deviceName,
+            int port,
+            AdvertisingCallback callback,
+            int errorCode,
+            String reason
+    ) {
+        if (advertisingRequested && registrationAttempts < MAX_REGISTRATION_ATTEMPTS) {
+            registrationAttempts++;
+            Log.w(TAG, "Advertisement registration failed (" + reason
+                    + "); retrying, attempt " + registrationAttempts);
+            postStatus("Advertisement registration failed; retrying");
+            mainHandler.postDelayed(() -> {
+                if (advertisingRequested && registrationListener == null) {
+                    registerAdvertisementAttempt(deviceName, port, callback);
+                }
+            }, REGISTRATION_RETRY_DELAY_MS);
+            return;
+        }
+        advertisingRequested = false;
+        registrationListener = null;
+        postError(reason, errorCode);
+        if (callback != null) {
+            callback.onFailed(reason);
         }
     }
 
@@ -210,6 +284,10 @@ public class NSDTransferDiscovery {
         if (!discoveryRequested || discoveryStarted || discoveryListener != null) {
             return;
         }
+        discoveryStopDeferredUntilStart = false;
+        discoveryStopAttempts = 0;
+        discoveryStartPending = true;
+        notifyTeardownStateChange();
 
         resolvedPeers.clear();
         resolvingNames.clear();
@@ -218,15 +296,16 @@ public class NSDTransferDiscovery {
         NsdManager.DiscoveryListener newListener = new NsdManager.DiscoveryListener() {
             @Override
             public void onDiscoveryStarted(String s) {
+                discoveryStartPending = false;
+                notifyTeardownStateChange();
                 if (!discoveryRequested || discoveryListener != this) {
                     if (discoveryListener == this) {
                         discoveryListener = null;
                     }
-                    try {
-                        nsdManager.stopServiceDiscovery(this);
-                    } catch (IllegalArgumentException ignored) {
-                        Log.i(TAG, "Discovery was already stopped during startup");
-                    }
+                    discoveryStopDeferredUntilStart = false;
+                    // Covers a stop that was requested while the start was still in
+                    // flight; the browse must not leak into the next session.
+                    requestDiscoveryStop(this);
                     return;
                 }
                 discoveryStarted = true;
@@ -236,6 +315,7 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onDiscoveryStopped(String s) {
+                completeDiscoveryTeardown(this);
                 if (discoveryListener != this) {
                     return;
                 }
@@ -299,6 +379,9 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onStartDiscoveryFailed(String s, int i) {
+                discoveryStartPending = false;
+                discoveryStopDeferredUntilStart = false;
+                notifyTeardownStateChange();
                 if (discoveryListener != this) {
                     return;
                 }
@@ -314,11 +397,17 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onStopDiscoveryFailed(String s, int i) {
+                completeDiscoveryTeardown(this);
                 if (discoveryListener != this) {
                     return;
                 }
                 Log.e(TAG,"Could not stop the reciever discovery");
                 postError("Could not stop discovery",i);
+                // The browse is still active at the platform; retry the stop so it
+                // cannot leak into the next session.
+                if (!discoveryRequested && discoveryStopAttempts < MAX_DISCOVERY_STOP_ATTEMPTS) {
+                    requestDiscoveryStop(this);
+                }
             }
         };
 
@@ -329,6 +418,8 @@ public class NSDTransferDiscovery {
         } catch (RuntimeException error) {
             discoveryListener = null;
             discoveryStarted = false;
+            discoveryStartPending = false;
+            notifyTeardownStateChange();
             releaseMulticastLock();
             Log.e(TAG, "Could not request service discovery", error);
             postError("Could not start discovery", -1);
@@ -374,11 +465,37 @@ public class NSDTransferDiscovery {
             NsdServiceInfo discoveredserviceInfo,
             NsdManager.DiscoveryListener sourceListener
     ){
+        resolveService(discoveredserviceInfo, sourceListener, 1);
+    }
+
+    @SuppressWarnings("deprecation")
+    private void resolveService(
+            final NsdServiceInfo discoveredserviceInfo,
+            final NsdManager.DiscoveryListener sourceListener,
+            final int attempt
+    ){
         nsdManager.resolveService(discoveredserviceInfo,
                 new NsdManager.ResolveListener() {
                     @Override
                     public void onResolveFailed(NsdServiceInfo nsdServiceInfo, int i) {
                         if (discoveryListener != sourceListener) {
+                            return;
+                        }
+                        if (attempt < MAX_RESOLVE_ATTEMPTS) {
+                            // A transient resolve failure must not silently drop an
+                            // otherwise visible receiver; retry a bounded number of
+                            // times while the name stays claimed in resolvingNames.
+                            Log.w(TAG, "Could not resolve service "
+                                    + nsdServiceInfo.getServiceName() + ", error code " + i
+                                    + "; retrying attempt " + (attempt + 1));
+                            mainHandler.postDelayed(() -> {
+                                if (discoveryRequested && discoveryListener == sourceListener) {
+                                    resolveService(discoveredserviceInfo, sourceListener,
+                                            attempt + 1);
+                                } else {
+                                    resolvingNames.remove(discoveredserviceInfo.getServiceName());
+                                }
+                            }, RESOLVE_RETRY_DELAY_MS);
                             return;
                         }
                         resolvingNames.remove(nsdServiceInfo.getServiceName());
@@ -439,16 +556,23 @@ public class NSDTransferDiscovery {
         resolvingNames.clear();
         resolvedPeers.clear();
 
-        if(oldListener!=null){
-            try{
-                nsdManager.stopServiceDiscovery(oldListener);
-            } catch(IllegalArgumentException e){
-                Log.w(TAG,"error in stopping the discovery");
-            }
+        if (discoveryStartPending) {
+            // The platform has not confirmed the start yet; stopping now fails with
+            // IllegalArgumentException on several Android versions and leaks an active
+            // browse. Defer the stop until onDiscoveryStarted arrives.
+            discoveryStopDeferredUntilStart = true;
+        } else if (oldListener != null) {
+            requestDiscoveryStop(oldListener);
         }
 
         discoveryStarted = false;
         releaseMulticastLock();
+    }
+
+    /** Stops and immediately restarts the browse; heals stale platform browse state. */
+    public void restartDiscovery() {
+        stopDiscovery();
+        startDiscovery();
     }
 
     public void stopAdvertising(){
@@ -511,13 +635,93 @@ public class NSDTransferDiscovery {
         }
 
         unregistrationRequested = true;
+        unregistrationAttempts++;
+        final NsdManager.RegistrationListener listenerToUnregister = registrationListener;
+        pendingUnregistrations.add(listenerToUnregister);
+        beginTeardownOperation();
         try{
-            nsdManager.unregisterService(registrationListener);
+            nsdManager.unregisterService(listenerToUnregister);
         } catch(IllegalArgumentException e){
             Log.w(TAG, "Service was already unregistered or no longer registered", e);
+            completeUnregistrationTeardown(listenerToUnregister);
             serviceRegistered = false;
             unregistrationRequested = false;
             registeredServiceName = null;
+        }
+    }
+
+    private void completeUnregistrationTeardown(NsdManager.RegistrationListener listener) {
+        if (pendingUnregistrations.remove(listener)) {
+            endTeardownOperation();
+        }
+    }
+
+    private void requestDiscoveryStop(NsdManager.DiscoveryListener listenerToStop) {
+        if (listenerToStop == null) {
+            return;
+        }
+        discoveryStopAttempts++;
+        pendingDiscoveryStops.add(listenerToStop);
+        beginTeardownOperation();
+        try {
+            nsdManager.stopServiceDiscovery(listenerToStop);
+        } catch (IllegalArgumentException error) {
+            Log.w(TAG, "Discovery was already stopped or never started", error);
+            completeDiscoveryTeardown(listenerToStop);
+        }
+    }
+
+    private void completeDiscoveryTeardown(NsdManager.DiscoveryListener listener) {
+        if (pendingDiscoveryStops.remove(listener)) {
+            endTeardownOperation();
+        }
+    }
+
+    private void beginTeardownOperation() {
+        synchronized (teardownMonitor) {
+            pendingTeardownOperations++;
+        }
+    }
+
+    private void endTeardownOperation() {
+        synchronized (teardownMonitor) {
+            if (pendingTeardownOperations > 0) {
+                pendingTeardownOperations--;
+            }
+            teardownMonitor.notifyAll();
+        }
+    }
+
+    private void notifyTeardownStateChange() {
+        synchronized (teardownMonitor) {
+            teardownMonitor.notifyAll();
+        }
+    }
+
+    /**
+     * Waits until every requested advertisement unregistration and discovery stop has
+     * been acknowledged by the platform. Must not be called on the thread that receives
+     * the NSD callbacks (the main looper), or the acknowledgment could never be
+     * delivered and this would always run into the timeout.
+     */
+    public void awaitTeardown(long timeoutMs) {
+        long deadlineMs = SystemClock.elapsedRealtime() + timeoutMs;
+        synchronized (teardownMonitor) {
+            while (pendingTeardownOperations > 0 || discoveryStartPending) {
+                long remainingMs = deadlineMs - SystemClock.elapsedRealtime();
+                if (remainingMs <= 0L) {
+                    Log.w(TAG, "NSD teardown incomplete after " + timeoutMs + " ms;"
+                            + " pendingOperations=" + pendingTeardownOperations
+                            + " discoveryStartPending=" + discoveryStartPending);
+                    break;
+                }
+                try {
+                    teardownMonitor.wait(remainingMs);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
         }
     }
 

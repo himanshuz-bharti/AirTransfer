@@ -26,6 +26,10 @@ import android.util.Size;
 import android.view.WindowManager;
 import android.widget.Toast;
 
+import java.io.File;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
@@ -80,6 +84,11 @@ public class AirTransferService extends LifecycleService {
     private static final long RECIEVER_TRANSFER_IDLE_TIMEOUT_MS = 180000L;
     private static final long RECIEVER_WAITING_FOR_SENDER_TIMEOUT_MS = 360000L;
     private static final long GESTURE_FRAME_INTERVAL_MS = 200L;
+    // Sender-side self-healing: restarts the receiver browse while no receiver is found.
+    private static final long SENDER_DISCOVERY_REFRESH_MS = 12000L;
+    // Bounded wait for the platform to acknowledge NSD unregister/stop requests before
+    // the next session may re-register the same service types.
+    private static final long NSD_TEARDOWN_WAIT_MS = 2500L;
     private Runnable receiverIdleTimeout;
     private Runnable receiverCompletionRunnable;
 
@@ -125,6 +134,14 @@ public class AirTransferService extends LifecycleService {
 
     private final ExecutorService galleryMatchExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService wsExecutor = Executors.newSingleThreadExecutor();
+    // Shared across sessions: NSD teardown must complete (off the main thread) even
+    // after the service instance that requested it has stopped.
+    private static final ExecutorService NSD_TEARDOWN_EXECUTOR =
+            Executors.newSingleThreadExecutor(command -> {
+                Thread thread = new Thread(command, "AirTransferNsdTeardown");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     private volatile TransferWebSocketClient webSocketClient;
     private TransferFileSender fileSender;
@@ -145,6 +162,7 @@ public class AirTransferService extends LifecycleService {
     private int websocketConnectAttempts;
     private Runnable websocketConnectRetry;
     private Runnable websocketConnectTimeout;
+    private Runnable senderDiscoveryRefresh;
     private boolean networkResourcesReleased;
 
     private final Runnable senderTimeout = () -> {
@@ -532,6 +550,7 @@ public class AirTransferService extends LifecycleService {
 
                         if(pendingReciever == null){
                             pendingReciever = peer;
+                            cancelSenderDiscoveryRefresh();
                             setDiscoveryStatus("Receiver found");
                             setConnectionStatus(pendingItemUri == null
                                     ? "Waiting for image match"
@@ -570,6 +589,7 @@ public class AirTransferService extends LifecycleService {
                                 scheduleSenderTimeout(SENDER_NO_RECEIVER_TIMEOUT_MS);
                             }
                             pendingReciever = null;
+                            scheduleSenderDiscoveryRefresh();
                             setDiscoveryStatus("Sender advertised; searching for receiver");
                             setConnectionStatus("Waiting for receiver");
                             setOverlayOperationStatus("Receiver went offline; waiting for another advertisement");
@@ -644,6 +664,7 @@ public class AirTransferService extends LifecycleService {
                             }
                             roleState = RoleState.SENDER_WAITING;
                             recieverNsd.startDiscovery();
+                            scheduleSenderDiscoveryRefresh();
                             setDiscoveryStatus("Sender advertised; searching for receiver");
                             setConnectionStatus("Waiting for receiver");
                             setTransferStatus("Capturing screen and matching Gallery");
@@ -707,9 +728,17 @@ public class AirTransferService extends LifecycleService {
         scheduleReceiverTransferIdleTimeout(null, "Receiver timed out waiting for sender");
 
         File temporaryDirectory = new File(getCacheDir(),"recieved-parts");
+        if (!isReceiverPortAvailable(RECIEVER_PORT)) {
+            Log.e(TAG, "Receiver port " + RECIEVER_PORT + " is unavailable;"
+                    + " a previous session's server socket may still be open");
+            finishReceiverOperation("Receiver port " + RECIEVER_PORT
+                    + " is unavailable; start the receiver again");
+            return;
+        }
         TransferWebSocketServer server = new TransferWebSocketServer(getApplicationContext(),
                 RECIEVER_PORT,
                 temporaryDirectory.toPath());
+        server.setReuseAddr(true);
         recieverServer = server;
 
         server.setTransferCompletedListener((uri,mimeType,displayName)->{
@@ -933,6 +962,18 @@ public class AirTransferService extends LifecycleService {
         }
     }
 
+    /** Fails fast when the transfer port is still held, instead of advertising a dead server. */
+    private boolean isReceiverPortAvailable(int port) {
+        try (ServerSocket probe = new ServerSocket()) {
+            probe.setReuseAddress(true);
+            probe.bind(new InetSocketAddress(port));
+            return true;
+        } catch (IOException error) {
+            Log.e(TAG, "Receiver port probe failed for " + port, error);
+            return false;
+        }
+    }
+
     private void openRecievedImage(Uri uri,String mimeType,String displayName){
         Log.i(TAG, "Opening received-image activity for " + uri
                 + "; Android=" + Build.VERSION.SDK_INT);
@@ -950,6 +991,36 @@ public class AirTransferService extends LifecycleService {
         senderDeadlineAtMs = SystemClock.elapsedRealtime() + timeoutMs;
         mainHandler.removeCallbacks(senderTimeout);
         mainHandler.postDelayed(senderTimeout, timeoutMs);
+    }
+
+    /**
+     * While the sender is waiting for a receiver and none has been found yet, restart
+     * the NSD browse periodically. A browse that started during a previous session's
+     * teardown churn can come up silently empty on some Android NSD implementations;
+     * restarting it re-attaches to live advertisements.
+     */
+    private void scheduleSenderDiscoveryRefresh() {
+        cancelSenderDiscoveryRefresh();
+        senderDiscoveryRefresh = () -> {
+            senderDiscoveryRefresh = null;
+            if (stopping || roleState != RoleState.SENDER_WAITING || pendingReciever != null) {
+                return;
+            }
+            if (recieverNsd != null) {
+                Log.i(TAG, "No receiver discovered yet; restarting receiver discovery");
+                setDiscoveryStatus("No receiver found; restarting discovery");
+                recieverNsd.restartDiscovery();
+            }
+            scheduleSenderDiscoveryRefresh();
+        };
+        mainHandler.postDelayed(senderDiscoveryRefresh, SENDER_DISCOVERY_REFRESH_MS);
+    }
+
+    private void cancelSenderDiscoveryRefresh() {
+        if (senderDiscoveryRefresh != null) {
+            mainHandler.removeCallbacks(senderDiscoveryRefresh);
+            senderDiscoveryRefresh = null;
+        }
     }
 
     private void scheduleReceiverTransferIdleTimeout(
@@ -1088,6 +1159,7 @@ public class AirTransferService extends LifecycleService {
 
         mainHandler.removeCallbacks(senderTimeout);
         mainHandler.removeCallbacks(receiverStartupTimeout);
+        cancelSenderDiscoveryRefresh();
         if (receiverCompletionRunnable != null) {
             mainHandler.removeCallbacks(receiverCompletionRunnable);
             receiverCompletionRunnable = null;
@@ -1427,6 +1499,7 @@ public class AirTransferService extends LifecycleService {
             return;
         }
         roleState = RoleState.SENDER_CONNECTING;
+        cancelSenderDiscoveryRefresh();
         websocketConnectAttempts = 0;
         scheduleSenderTimeout(SENDER_TIMEOUT_MS);
         setDiscoveryStatus("Receiver selected");
@@ -1852,6 +1925,7 @@ public class AirTransferService extends LifecycleService {
         senderDeadlineAtMs = 0L;
         cancelWebSocketConnectCallbacks();
         mainHandler.removeCallbacks(senderTimeout);
+        cancelSenderDiscoveryRefresh();
         capturePending.set(false);
 
         offerNsd.stopAdvertising();
@@ -1890,6 +1964,7 @@ public class AirTransferService extends LifecycleService {
             return;
         }
         networkResourcesReleased = true;
+        cancelSenderDiscoveryRefresh();
         mainHandler.removeCallbacks(senderTimeout);
         mainHandler.removeCallbacks(receiverStartupTimeout);
         if (receiverCompletionRunnable != null) {
@@ -1926,17 +2001,44 @@ public class AirTransferService extends LifecycleService {
         if(recieverNsd != null){
             recieverNsd.stopAll();
         }
-        if (recieverServer != null) {
-            TransferWebSocketServer serverToStop = recieverServer;
-            recieverServer = null;
-            try {
-                serverToStop.stop(2000);
-                Log.i(TAG, "Receiver WebSocket server stopped before service teardown");
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                Log.w(TAG, "Interrupted while waiting for receiver server shutdown.", e);
-            } catch (RuntimeException e) {
-                Log.w(TAG, "Could not stop receiver server cleanly.", e);
+        final TransferWebSocketServer serverToStop = recieverServer;
+        recieverServer = null;
+        try {
+            NSD_TEARDOWN_EXECUTOR.execute(() -> {
+                // NSD callbacks are delivered on the main looper, so the wait for the
+                // unregister/stop acknowledgments must happen off the main thread. The
+                // next session must not re-register the same service types before the
+                // platform has processed this session's teardown, otherwise the new
+                // advertisement can silently never be announced and peers stop
+                // discovering the re-advertised service.
+                if (offerNsd != null) {
+                    offerNsd.awaitTeardown(NSD_TEARDOWN_WAIT_MS);
+                }
+                if (recieverNsd != null) {
+                    recieverNsd.awaitTeardown(NSD_TEARDOWN_WAIT_MS);
+                }
+                if (serverToStop != null) {
+                    try {
+                        serverToStop.stop(2000);
+                        Log.i(TAG, "Receiver WebSocket server stopped before service teardown");
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        Log.w(TAG, "Interrupted while waiting for receiver server shutdown.", e);
+                    } catch (RuntimeException e) {
+                        Log.w(TAG, "Could not stop receiver server cleanly.", e);
+                    }
+                }
+            });
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Could not schedule network teardown", error);
+            if (serverToStop != null) {
+                try {
+                    serverToStop.stop(2000);
+                } catch (InterruptedException stopError) {
+                    Thread.currentThread().interrupt();
+                } catch (RuntimeException stopError) {
+                    Log.w(TAG, "Could not stop receiver server cleanly.", stopError);
+                }
             }
         }
         if (fileSender != null) {
