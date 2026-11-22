@@ -11,8 +11,11 @@ import android.util.Log;
 
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class NSDTransferDiscovery {
@@ -57,6 +60,7 @@ public class NSDTransferDiscovery {
     private final NsdManager nsdManager;
     private final Listener listener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final String localInstanceId = UUID.randomUUID().toString();
     private final Map<String,Peer> resolvedPeers = new ConcurrentHashMap<>();
     private final Set<String> resolvingNames = ConcurrentHashMap.newKeySet();
 
@@ -66,6 +70,7 @@ public class NSDTransferDiscovery {
     private volatile boolean advertisingRequested;
     private volatile boolean discoveryRequested;
     private boolean serviceRegistered;
+    private boolean unregistrationRequested;
     private boolean discoveryStarted;
     private String registeredServiceName;
 
@@ -88,8 +93,8 @@ public class NSDTransferDiscovery {
     }
 
     public void startAdvertising(String deviceName,int port,AdvertisingCallback callback){
-        if(advertisingRequested){
-            String reason = "An advertising is already requested";
+        if(advertisingRequested || serviceRegistered){
+            String reason = "An advertising is already requested or still unregistering";
             Log.e(TAG, reason);
             if(callback!=null){
                 callback.onFailed(reason);
@@ -106,17 +111,22 @@ public class NSDTransferDiscovery {
         }
         advertisingRequested = true;
         String safeName = sanitizeName(deviceName);
-        String requestedServiceName = "Airtransfer-" + safeName;
+        String advertisementId = UUID.randomUUID().toString().substring(0, 8);
+        String requestedServiceName = "Airtransfer-" + safeName + "-" + advertisementId;
 
         NsdServiceInfo serviceInfo = new NsdServiceInfo();
         serviceInfo.setServiceName(requestedServiceName);
         serviceInfo.setServiceType(serviceType);
         serviceInfo.setAttribute("device",sanitizeDeviceName(deviceName));
+        serviceInfo.setAttribute("instance", localInstanceId);
         serviceInfo.setPort(port);
 
         registrationListener = new NsdManager.RegistrationListener() {
             @Override
             public void onRegistrationFailed(NsdServiceInfo nsdServiceInfo, int i) {
+                if (registrationListener != this) {
+                    return;
+                }
                 serviceRegistered = false;
                 advertisingRequested = false;
                 String reason = "Registration advertisement failed" + i;
@@ -128,7 +138,17 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onServiceRegistered(NsdServiceInfo nsdServiceInfo) {
+                if (registrationListener != this) {
+                    Log.i(TAG, "Unregistering a late service registration from an old listener");
+                    try {
+                        nsdManager.unregisterService(this);
+                    } catch (IllegalArgumentException ignored) {
+                        Log.i(TAG, "Late service registration was already unregistered");
+                    }
+                    return;
+                }
                 serviceRegistered = true;
+                unregistrationRequested = false;
                 registeredServiceName = nsdServiceInfo.getServiceName();
 
                 Log.i(TAG, "NSD_ADVERTISED name=" + registeredServiceName
@@ -147,20 +167,37 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onServiceUnregistered(NsdServiceInfo nsdServiceInfo) {
+                if (registrationListener != this) {
+                    return;
+                }
                 serviceRegistered = false;
+                unregistrationRequested = false;
                 registeredServiceName = null;
-                postStatus("service unregistration."+registeredServiceName + "is no longer discoverable");
+                postStatus("Service is no longer discoverable");
             }
 
             @Override
             public void onUnregistrationFailed(NsdServiceInfo nsdServiceInfo, int i) {
+                if (registrationListener != this) {
+                    return;
+                }
                 serviceRegistered = true;
-
-                postStatus("service unregistered failed.Errorcode"+i);
+                unregistrationRequested = false;
+                postStatus("Service unregistration failed. Error code " + i);
             }
         };
 
-        nsdManager.registerService(serviceInfo,NsdManager.PROTOCOL_DNS_SD,registrationListener);
+        try {
+            nsdManager.registerService(serviceInfo,NsdManager.PROTOCOL_DNS_SD,registrationListener);
+        } catch (RuntimeException error) {
+            advertisingRequested = false;
+            registrationListener = null;
+            Log.e(TAG, "Could not request service registration", error);
+            if (callback != null) {
+                callback.onFailed("Could not request service registration: "
+                        + error.getMessage());
+            }
+        }
     }
 
     public void startDiscovery(){
@@ -181,7 +218,7 @@ public class NSDTransferDiscovery {
         NsdManager.DiscoveryListener newListener = new NsdManager.DiscoveryListener() {
             @Override
             public void onDiscoveryStarted(String s) {
-                if (!discoveryRequested) {
+                if (!discoveryRequested || discoveryListener != this) {
                     if (discoveryListener == this) {
                         discoveryListener = null;
                     }
@@ -199,7 +236,7 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onDiscoveryStopped(String s) {
-                if (discoveryListener != null && discoveryListener != this) {
+                if (discoveryListener != this) {
                     return;
                 }
                 discoveryStarted = false;
@@ -221,8 +258,8 @@ public class NSDTransferDiscovery {
                     return;
                 }
                 String name = nsdServiceInfo.getServiceName();
-                if(name != null && name.equalsIgnoreCase(registeredServiceName)){
-                    Log.i(TAG,"discovered service is equal to my advertised service");
+                if (isLocalService(nsdServiceInfo, name)) {
+                    Log.i(TAG, "Ignoring this device's own advertised service: " + name);
                     return;
                 }
 
@@ -242,6 +279,9 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onServiceLost(NsdServiceInfo nsdServiceInfo) {
+                if (!discoveryRequested || discoveryListener != this) {
+                    return;
+                }
                 String name = nsdServiceInfo.getServiceName();
 
                 if(name == null){
@@ -259,7 +299,7 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onStartDiscoveryFailed(String s, int i) {
-                if (discoveryListener != null && discoveryListener != this) {
+                if (discoveryListener != this) {
                     return;
                 }
                 discoveryStarted = false;
@@ -274,6 +314,9 @@ public class NSDTransferDiscovery {
 
             @Override
             public void onStopDiscoveryFailed(String s, int i) {
+                if (discoveryListener != this) {
+                    return;
+                }
                 Log.e(TAG,"Could not stop the reciever discovery");
                 postError("Could not stop discovery",i);
             }
@@ -293,6 +336,32 @@ public class NSDTransferDiscovery {
         }
     }
 
+    private boolean isLocalService(NsdServiceInfo serviceInfo, String serviceName) {
+        if (serviceName != null && registeredServiceName != null
+                && serviceName.equalsIgnoreCase(registeredServiceName)) {
+            return true;
+        }
+
+        Map<String, byte[]> attributes = serviceInfo.getAttributes();
+        byte[] instanceBytes = attributes == null ? null : attributes.get("instance");
+        if (instanceBytes != null
+                && localInstanceId.equals(new String(instanceBytes, StandardCharsets.UTF_8))) {
+            return true;
+        }
+
+        InetAddress host = serviceInfo.getHost();
+        if (host != null) {
+            try {
+                if (NetworkInterface.getByInetAddress(host) != null) {
+                    return true;
+                }
+            } catch (SocketException error) {
+                Log.w(TAG, "Could not compare resolved NSD host to local interfaces", error);
+            }
+        }
+        return false;
+    }
+
     private void scheduleDiscoveryRetry() {
         if (discoveryRequested) {
             mainHandler.removeCallbacks(discoveryRetry);
@@ -309,12 +378,18 @@ public class NSDTransferDiscovery {
                 new NsdManager.ResolveListener() {
                     @Override
                     public void onResolveFailed(NsdServiceInfo nsdServiceInfo, int i) {
+                        if (discoveryListener != sourceListener) {
+                            return;
+                        }
                         resolvingNames.remove(nsdServiceInfo.getServiceName());
                         Log.w(TAG,"Could not resolve the service name, error code"+i);
                     }
 
                     @Override
                     public void onServiceResolved(NsdServiceInfo nsdServiceInfo) {
+                        if (discoveryListener != sourceListener) {
+                            return;
+                        }
                         String name = nsdServiceInfo.getServiceName();
                         resolvingNames.remove(name);
                         Map<String, byte[]> attributes = nsdServiceInfo.getAttributes();
@@ -326,7 +401,12 @@ public class NSDTransferDiscovery {
                             deviceName = name;
                         }
 
-                        if(discoveryListener != sourceListener || name == null){
+                        if(name == null){
+                            return;
+                        }
+                        if (isLocalService(nsdServiceInfo, name)) {
+                            Log.i(TAG, "Ignoring delayed resolution of this device's own service: "
+                                    + name);
                             return;
                         }
 
@@ -426,15 +506,18 @@ public class NSDTransferDiscovery {
     }
 
     private void unregisterRegisteredService(){
-        if(registrationListener == null || !serviceRegistered){
+        if (registrationListener == null || !serviceRegistered || unregistrationRequested) {
             return;
         }
 
+        unregistrationRequested = true;
         try{
             nsdManager.unregisterService(registrationListener);
         } catch(IllegalArgumentException e){
-            Log.e(TAG,"error in unregistering the registered service");
+            Log.w(TAG, "Service was already unregistered or no longer registered", e);
             serviceRegistered = false;
+            unregistrationRequested = false;
+            registeredServiceName = null;
         }
     }
 

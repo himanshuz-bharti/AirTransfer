@@ -25,6 +25,8 @@ public class TransferFileSender {
 
     private static final String TAG = "TransferFileSender";
     public static final int CHUNK_SIZE = 64*1024;
+    private static final long REPLY_TIMEOUT_SECONDS = 30L;
+    private static final long FINAL_ACK_TIMEOUT_SECONDS = 300L;
 
     private final TransferWebSocketClient webSocketClient;
     private final BlockingQueue<String> replies = new LinkedBlockingQueue<>();
@@ -155,11 +157,17 @@ public class TransferFileSender {
         webSocketClient.send(endmessage);
 
         String endmessageexpected = TransferProtocol.DONE + "|" + transferId + "|" + totalsent;
-        expectReply(endmessageexpected);
+        // The receiver may need time to publish the completed file to MediaStore before
+        // acknowledging it. Do not close the socket during that commit window.
+        expectReply(endmessageexpected, FINAL_ACK_TIMEOUT_SECONDS);
     }
 
     private void expectReply(String expected) throws Exception {
-        String actual = replies.poll(30, TimeUnit.SECONDS);
+        expectReply(expected, REPLY_TIMEOUT_SECONDS);
+    }
+
+    private void expectReply(String expected, long timeoutSeconds) throws Exception {
+        String actual = replies.poll(timeoutSeconds, TimeUnit.SECONDS);
 
         if(actual == null){
             throw new TimeoutException("Timed out waiting for:" + expected);

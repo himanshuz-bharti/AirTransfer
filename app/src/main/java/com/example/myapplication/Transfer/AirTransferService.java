@@ -69,13 +69,19 @@ public class AirTransferService extends LifecycleService {
     }
 
     private static final int RECIEVER_PORT = 8080;
-    private static final long SENDER_TIMEOUT_MS = 120000L;
+    // Allow slow receivers to commit large images and return the final DONE reply.
+    private static final long SENDER_TIMEOUT_MS = 360000L;
     private static final long SENDER_MATCH_TIMEOUT_MS = 300000L;
     private static final long SENDER_NO_RECEIVER_TIMEOUT_MS = 90000L;
+    private static final long WEBSOCKET_CONNECT_ATTEMPT_TIMEOUT_MS = 8000L;
+    private static final long WEBSOCKET_CONNECT_RETRY_DELAY_MS = 1000L;
+    private static final int MAX_WEBSOCKET_CONNECT_ATTEMPTS = 30;
     private static final long RECIEVER_TIMEOUT_MS = 60000L;
     private static final long RECIEVER_TRANSFER_IDLE_TIMEOUT_MS = 180000L;
+    private static final long RECIEVER_WAITING_FOR_SENDER_TIMEOUT_MS = 360000L;
     private static final long GESTURE_FRAME_INTERVAL_MS = 200L;
     private Runnable receiverIdleTimeout;
+    private Runnable receiverCompletionRunnable;
 
     private RoleState roleState = RoleState.IDLE;
 
@@ -91,6 +97,7 @@ public class AirTransferService extends LifecycleService {
     private TransferWebSocketServer recieverServer;
     private NSDTransferDiscovery.Peer pendingReciever;
     private String connectedSenderHost;
+    private int connectedSenderRemotePort = -1;
     private String connectedSenderIdentity;
     private Uri pendingItemUri;
 
@@ -104,6 +111,8 @@ public class AirTransferService extends LifecycleService {
     public static final String ACTION_STOP = "com.example.myapplication.ACTION_STOP_AIR_TRANSFER";
     private final AtomicBoolean capturePending = new AtomicBoolean(false);
     private final AtomicBoolean receiverTransferCompleted = new AtomicBoolean(false);
+    private final AtomicBoolean receiverTransferCommitting = new AtomicBoolean(false);
+    private final AtomicBoolean receiverTransferStarted = new AtomicBoolean(false);
     private final Handler mainHandler = new Handler();
 
     private MediaProjection mediaProjection;
@@ -133,6 +142,9 @@ public class AirTransferService extends LifecycleService {
     private volatile long operationGeneration;
     private volatile long captureRequestGeneration;
     private long senderDeadlineAtMs;
+    private int websocketConnectAttempts;
+    private Runnable websocketConnectRetry;
+    private Runnable websocketConnectTimeout;
     private boolean networkResourcesReleased;
 
     private final Runnable senderTimeout = () -> {
@@ -171,6 +183,9 @@ public class AirTransferService extends LifecycleService {
         transferEffectOverlay = new TransferEffectOverlay(this);
         receiverStatusOverlay = new ReceiverStatusOverlay(this);
         gestureDebugOverlay = new GestureDebugOverlay(this);
+        gestureDebugOverlay.setServiceRunning(true);
+        gestureDebugOverlay.setControlListener(() ->
+                stopEverything("Stopped by overlay control", true));
         createNotificationChannel();
         initializeNSD();
     }
@@ -500,8 +515,18 @@ public class AirTransferService extends LifecycleService {
                             Log.w(TAG,"Ignore receiver offer with invalid address");
                             return;
                         }
-                        if(roleState != RoleState.SENDER_WAITING){
+                        if(roleState != RoleState.SENDER_WAITING
+                                && roleState != RoleState.SENDER_CONNECTING){
                             Log.i(TAG, "Receiver offer arrived while sender role is " + roleState);
+                            return;
+                        }
+
+                        if (roleState == RoleState.SENDER_CONNECTING
+                                && pendingReciever != null
+                                && pendingReciever.serviceName.equals(peer.serviceName)) {
+                            pendingReciever = peer;
+                            Log.i(TAG, "Updated resolved receiver address during connection retries: "
+                                    + peer);
                             return;
                         }
 
@@ -526,13 +551,28 @@ public class AirTransferService extends LifecycleService {
                         if (peer == null) {
                             return;
                         }
-                        if(pendingReciever != null
+                        if (pendingReciever != null
                                 && pendingReciever.serviceName.equals(peer.serviceName)
-                             && roleState == RoleState.SENDER_WAITING){
+                                && (roleState == RoleState.SENDER_WAITING
+                                || roleState == RoleState.SENDER_CONNECTING)) {
+                            if (roleState == RoleState.SENDER_CONNECTING) {
+                                cancelWebSocketConnectCallbacks();
+                                TransferWebSocketClient oldClient = webSocketClient;
+                                webSocketClient = null;
+                                if (fileSender != null) {
+                                    fileSender.shutdown();
+                                    fileSender = null;
+                                }
+                                if (oldClient != null) {
+                                    oldClient.close();
+                                }
+                                roleState = RoleState.SENDER_WAITING;
+                                scheduleSenderTimeout(SENDER_NO_RECEIVER_TIMEOUT_MS);
+                            }
                             pendingReciever = null;
                             setDiscoveryStatus("Sender advertised; searching for receiver");
                             setConnectionStatus("Waiting for receiver");
-                            setOverlayOperationStatus("Receiver went offline; continuing image match");
+                            setOverlayOperationStatus("Receiver went offline; waiting for another advertisement");
                             showPeerStatus("Receiver disconnected; searching again");
                         }
 
@@ -576,6 +616,8 @@ public class AirTransferService extends LifecycleService {
         }
 
         operationGeneration++;
+        websocketConnectAttempts = 0;
+        cancelWebSocketConnectCallbacks();
         final long senderGeneration = operationGeneration;
         if (receiverStatusOverlay != null) {
             receiverStatusOverlay.remove();
@@ -643,6 +685,8 @@ public class AirTransferService extends LifecycleService {
 
         mainHandler.removeCallbacks(receiverStartupTimeout);
         receiverTransferCompleted.set(false);
+        receiverTransferCommitting.set(false);
+        receiverTransferStarted.set(false);
         operationGeneration++;
 
         if (transferEffectOverlay != null) {
@@ -650,6 +694,7 @@ public class AirTransferService extends LifecycleService {
         }
         roleState = RoleState.RECIEVER_STARTING;
         connectedSenderHost = null;
+        connectedSenderRemotePort = -1;
         connectedSenderIdentity = null;
         setDiscoveryStatus("Searching for sender");
         setConnectionStatus("Waiting for WebSocket connection");
@@ -671,11 +716,20 @@ public class AirTransferService extends LifecycleService {
             if (recieverServer != server) {
                 return;
             }
+            receiverTransferCommitting.set(false);
             receiverTransferCompleted.set(true);
+            Log.i(TAG, "Receiver persisted image; completion is recorded before DONE acknowledgment");
+            if (receiverIdleTimeout != null) {
+                mainHandler.removeCallbacks(receiverIdleTimeout);
+                receiverIdleTimeout = null;
+            }
+            mainHandler.removeCallbacks(receiverStartupTimeout);
             setTransferStatus("Image received successfully");
             setOverlayOperationStatus("Image saved; opening received image");
-            mainHandler.postDelayed(()->{
-                if(recieverServer == server && roleState == RoleState.RECIEVER_LISTENING){
+            receiverCompletionRunnable = () -> {
+                receiverCompletionRunnable = null;
+                if (!stopping && recieverServer == server
+                        && roleState == RoleState.RECIEVER_LISTENING) {
                     try {
                         openRecievedImage(uri,mimeType,displayName);
                     } catch (RuntimeException error) {
@@ -684,7 +738,8 @@ public class AirTransferService extends LifecycleService {
                         finishReceiverOperation("Image received successfully");
                     }
                 }
-            },1000L);
+            };
+            mainHandler.postDelayed(receiverCompletionRunnable, 1000L);
         });
         server.setClientConnectionListener(new TransferWebSocketServer.ClientConnectionListener() {
             @Override
@@ -702,6 +757,8 @@ public class AirTransferService extends LifecycleService {
                             ? "Sender at " + remoteHost
                             : formatPeer(senderPeer);
                     connectedSenderHost = remoteHost;
+                    connectedSenderRemotePort = remotePort;
+                    receiverTransferStarted.set(false);
                     connectedSenderIdentity = senderIdentity;
                     setDiscoveryStatus("Sender connected");
                     setConnectionStatus("WebSocket connected");
@@ -717,12 +774,48 @@ public class AirTransferService extends LifecycleService {
             @Override
             public void onDisconnected(String remoteHost, int remotePort) {
                 mainHandler.post(() -> {
-                    if (recieverServer == server
-                            && (roleState == RoleState.RECIEVER_STARTING
-                            || roleState == RoleState.RECIEVER_LISTENING)
-                            && !receiverTransferCompleted.get()) {
-                        finishReceiverOperation("Sender disconnected before transfer completed");
+                    boolean completed = receiverTransferCompleted.get();
+                    boolean transferStarted = receiverTransferStarted.get();
+                    Log.i(TAG, "Receiver socket closed by " + remoteHost + ":" + remotePort
+                            + "; transferStarted=" + transferStarted
+                            + "; transferCompleted=" + completed
+                            + "; serverHasActiveConnection=" + server.hasActiveConnection()
+                            + "; role=" + roleState);
+                    if (recieverServer != server
+                            || (roleState != RoleState.RECIEVER_STARTING
+                            && roleState != RoleState.RECIEVER_LISTENING)
+                            || completed || receiverTransferCommitting.get()) {
+                        return;
                     }
+                    if (server.hasActiveConnection()) {
+                        Log.i(TAG, "Ignoring close from prior socket; receiver has a new active socket");
+                        return;
+                    }
+                    if (connectedSenderRemotePort != remotePort
+                            || !sameHost(connectedSenderHost, remoteHost)) {
+                        Log.i(TAG, "Ignoring disconnect from a stale/non-active sender socket");
+                        return;
+                    }
+
+                    // A socket may be opened by a stale NSD result or a previous
+                    // connection attempt and close without ever beginning a transfer.
+                    // Even an interrupted transfer should not tear down the receiver:
+                    // abortTransfer() has already removed its partial file, and keeping
+                    // the server/advertisement alive lets the sender retry in a new session.
+                    connectedSenderHost = null;
+                    connectedSenderRemotePort = -1;
+                    connectedSenderIdentity = null;
+                    receiverTransferStarted.set(false);
+                    receiverStatusOverlay.show(ReceiverStatusOverlay.State.READY);
+                    setConnectionStatus("Waiting for sender");
+                    setTransferStatus(transferStarted
+                            ? "Previous transfer interrupted; waiting for sender"
+                            : "Idle");
+                    setDiscoveryStatus("Receiver advertised; waiting for sender");
+                    showPeerStatus("Sender disconnected; receiver is still available");
+                    setOverlayOperationStatus("Receiver is still listening for a sender");
+                    scheduleReceiverTransferIdleTimeout(null,
+                            "Receiver timed out waiting for sender");
                 });
             }
 
@@ -730,7 +823,9 @@ public class AirTransferService extends LifecycleService {
             public void onTransferActivity(long bytesReceived, long totalBytes) {
                 mainHandler.post(() -> {
                     if (recieverServer == server && roleState == RoleState.RECIEVER_LISTENING
-                            && !receiverTransferCompleted.get()) {
+                            && !receiverTransferCompleted.get()
+                            && !receiverTransferCommitting.get()) {
+                        receiverTransferStarted.set(true);
                         if (totalBytes > 0) {
                             int percent = (int) Math.min(100L,
                                     (bytesReceived * 100L) / totalBytes);
@@ -740,6 +835,31 @@ public class AirTransferService extends LifecycleService {
                         }
                         scheduleReceiverTransferIdleTimeout(server,
                                 "Receiver transfer timed out");
+                    }
+                });
+            }
+
+            @Override
+            public void onTransferCommitting() {
+                receiverTransferCommitting.set(true);
+                mainHandler.post(() -> {
+                    if (recieverServer == server && isReceiverState()) {
+                        if (receiverIdleTimeout != null) {
+                            mainHandler.removeCallbacks(receiverIdleTimeout);
+                            receiverIdleTimeout = null;
+                        }
+                        setTransferStatus("Saving received image");
+                    }
+                });
+            }
+
+            @Override
+            public void onTransferCommitFailed(String reason) {
+                receiverTransferCommitting.set(false);
+                mainHandler.post(() -> {
+                    if (recieverServer == server && isReceiverState()
+                            && !receiverTransferCompleted.get()) {
+                        finishReceiverOperation("Could not save received image: " + reason);
                     }
                 });
             }
@@ -754,6 +874,8 @@ public class AirTransferService extends LifecycleService {
                     setDiscoveryStatus("Advertising receiver");
                     setConnectionStatus("Waiting for sender");
                 }
+                Log.i(TAG, "Receiver session " + operationGeneration
+                        + " listening on port " + RECIEVER_PORT);
                 recieverNsd.startAdvertising(Build.MODEL, RECIEVER_PORT,
                         new NSDTransferDiscovery.AdvertisingCallback() {
                             @Override
@@ -839,6 +961,10 @@ public class AirTransferService extends LifecycleService {
         }
 
         receiverIdleTimeout = () -> {
+            if (receiverTransferCommitting.get()) {
+                scheduleReceiverTransferIdleTimeout(server, timeoutMessage);
+                return;
+            }
             boolean waitingForConnection = server == null
                     && recieverServer != null
                     && roleState == RoleState.RECIEVER_LISTENING
@@ -851,7 +977,10 @@ public class AirTransferService extends LifecycleService {
             }
         };
 
-        mainHandler.postDelayed(receiverIdleTimeout,RECIEVER_TRANSFER_IDLE_TIMEOUT_MS);
+        long idleTimeoutMs = server == null
+                ? RECIEVER_WAITING_FOR_SENDER_TIMEOUT_MS
+                : RECIEVER_TRANSFER_IDLE_TIMEOUT_MS;
+        mainHandler.postDelayed(receiverIdleTimeout, idleTimeoutMs);
     }
 
     private void finishReceiverOperation(String message){
@@ -871,32 +1000,25 @@ public class AirTransferService extends LifecycleService {
 
         operationGeneration++;
         roleState = RoleState.IDLE;
-        if(recieverServer!=null){
-            try{
-                recieverServer.stop();
-            } catch(InterruptedException e){
-                Thread.currentThread().interrupt();
-                Log.w(TAG,"Interrupted while stopping recieevrServer");
-            } catch(RuntimeException e){
-                Log.w(TAG,"Error stopping recieverServer");
-            }
-
-            recieverServer = null;
-        }
-
+        // Network teardown owns stopping and waiting for the server thread. Do not
+        // drop this reference here or a new service instance could bind before the old
+        // listener has finished closing.
         if(recieverNsd != null){
             recieverNsd.stopAdvertising();
         }
         connectedSenderHost = null;
+        connectedSenderRemotePort = -1;
         connectedSenderIdentity = null;
         receiverTransferCompleted.set(false);
+        receiverTransferStarted.set(false);
+        receiverTransferCommitting.set(false);
         setDiscoveryStatus("Idle");
         setConnectionStatus("Disconnected");
         setTransferStatus("Idle");
         showPeerStatus("No peer connected");
         setOverlayOperationStatus("Ready for gesture");
         showStatus(message);
-        resumeGestureCamera();
+        stopEverything(message, true);
     }
 
 
@@ -959,10 +1081,17 @@ public class AirTransferService extends LifecycleService {
         }
 
         stopping = true;
+        if (gestureDebugOverlay != null) {
+            gestureDebugOverlay.setServiceRunning(false);
+        }
         stopForeground(STOP_FOREGROUND_REMOVE);
 
         mainHandler.removeCallbacks(senderTimeout);
         mainHandler.removeCallbacks(receiverStartupTimeout);
+        if (receiverCompletionRunnable != null) {
+            mainHandler.removeCallbacks(receiverCompletionRunnable);
+            receiverCompletionRunnable = null;
+        }
 
         if(receiverIdleTimeout != null){
             mainHandler.removeCallbacks(receiverIdleTimeout);
@@ -976,12 +1105,29 @@ public class AirTransferService extends LifecycleService {
 
         galleryMatchExecutor.shutdownNow();
         wsExecutor.shutdownNow();
+        clearTemporaryTransferFiles();
         try{
             releaseCaptureResources(stopProjection);
         }catch(RuntimeException error){
             Log.e(TAG,"Error stopping camera/capture resources"+error);
         }
         stopSelf();
+    }
+
+    private void clearTemporaryTransferFiles() {
+        File temporaryDirectory = new File(getCacheDir(), "recieved-parts");
+        File[] temporaryFiles = temporaryDirectory.listFiles();
+        if (temporaryFiles != null) {
+            for (File temporaryFile : temporaryFiles) {
+                if (temporaryFile.isFile() && !temporaryFile.delete()) {
+                    Log.w(TAG, "Could not delete temporary transfer file: "
+                            + temporaryFile.getName());
+                }
+            }
+        }
+        if (temporaryDirectory.exists() && !temporaryDirectory.delete()) {
+            Log.w(TAG, "Could not remove temporary transfer directory");
+        }
     }
 
     private void startForegroundForeground(){
@@ -1280,9 +1426,8 @@ public class AirTransferService extends LifecycleService {
             Log.i(TAG,"reciever has no usable port or ");
             return;
         }
-        recieverNsd.stopDiscovery();
-
         roleState = RoleState.SENDER_CONNECTING;
+        websocketConnectAttempts = 0;
         scheduleSenderTimeout(SENDER_TIMEOUT_MS);
         setDiscoveryStatus("Receiver selected");
         setConnectionStatus("Connecting to receiver");
@@ -1294,20 +1439,47 @@ public class AirTransferService extends LifecycleService {
     }
 
     private void connectToReciever(NSDTransferDiscovery.Peer recieverPeer){
+        if (stopping || roleState != RoleState.SENDER_CONNECTING) {
+            return;
+        }
+        if (websocketConnectRetry != null) {
+            mainHandler.removeCallbacks(websocketConnectRetry);
+            websocketConnectRetry = null;
+        }
+        if (websocketConnectTimeout != null) {
+            mainHandler.removeCallbacks(websocketConnectTimeout);
+            websocketConnectTimeout = null;
+        }
+        if (websocketConnectAttempts >= MAX_WEBSOCKET_CONNECT_ATTEMPTS) {
+            finishSenderAttempt("Could not connect to receiver after "
+                    + websocketConnectAttempts + " attempts");
+            return;
+        }
+        websocketConnectAttempts++;
+        final int attempt = websocketConnectAttempts;
+        final long attemptGeneration = operationGeneration;
+        final AtomicBoolean connectionEstablished = new AtomicBoolean(false);
+        final AtomicBoolean failureHandled = new AtomicBoolean(false);
         try{
             URI uri = new URI("ws", null, recieverPeer.hostAddress,
                     recieverPeer.port, "/", null, null);
-            Log.i(TAG,"Connectiong to discovered peer:"+uri);
+            Log.i(TAG, "WebSocket connect attempt " + attempt + "/"
+                    + MAX_WEBSOCKET_CONNECT_ATTEMPTS + " to " + uri);
             final TransferWebSocketClient[] clientRef = new TransferWebSocketClient[1];
             TransferWebSocketClient client = new TransferWebSocketClient(uri,
                     new TransferWebSocketClient.Listener() {
                         @Override
                         public void onConnected() {
-                            Log.i(TAG,"Connected to reciever");
+                            Log.i(TAG, "WebSocket transport opened for attempt " + attempt);
+                            connectionEstablished.set(true);
                             mainHandler.post(()->{
-                                if (webSocketClient != clientRef[0]) {
+                                if (operationGeneration != attemptGeneration
+                                        || webSocketClient != clientRef[0]
+                                        || roleState != RoleState.SENDER_CONNECTING) {
                                     return;
                                 }
+                                cancelWebSocketConnectCallbacks();
+                                recieverNsd.stopDiscovery();
                                 setConnectionStatus("WebSocket connected");
                                 setTransferStatus("Starting image transfer");
                                 showPeerStatus("WebSocket connected to: " + formatPeer(recieverPeer));
@@ -1318,28 +1490,44 @@ public class AirTransferService extends LifecycleService {
 
                         @Override
                         public void onDisconnected() {
-                            Log.i(TAG,"Disocnnected from recievr");
+                            Log.i(TAG,"Disocnnected from reciever");
 
                             mainHandler.post(()->{
-                                if(webSocketClient == clientRef[0]
-                                        && (roleState == RoleState.SENDER_CONNECTING ||
-                                        roleState == RoleState.SENDER_SENDING)){
-                                    finishSenderAttempt("Connection to reciever was lost");
+                                if (operationGeneration != attemptGeneration
+                                        || webSocketClient != clientRef[0]) {
+                                    return;
+                                }
+                                if (roleState == RoleState.SENDER_CONNECTING
+                                        && !connectionEstablished.get()) {
+                                    handleWebSocketConnectFailure(clientRef[0], recieverPeer,
+                                            attemptGeneration, failureHandled,
+                                            connectionEstablished, "Socket closed before connect");
+                                } else if (roleState == RoleState.SENDER_SENDING) {
+                                    finishSenderAttempt("Connection to receiver was lost");
                                 }
                             });
                         }
 
                         @Override
                         public void onError(Exception e) {
-                            Log.e(TAG,"reciever connection error"+e);
-                            mainHandler.post(()->{
-                                if(webSocketClient == clientRef[0]
-                                        && (roleState == RoleState.SENDER_CONNECTING ||
-                                        roleState == RoleState.SENDER_SENDING)){
-                                    finishSenderAttempt("Error connecting to reciever");
+                            Log.e(TAG, "WebSocket error for attempt " + attempt + ": "
+                                    + e.getMessage(), e);
+                            mainHandler.post(() -> {
+                                if (operationGeneration != attemptGeneration
+                                        || webSocketClient != clientRef[0]) {
+                                    return;
+                                }
+                                if (roleState == RoleState.SENDER_CONNECTING
+                                        && !connectionEstablished.get()) {
+                                    handleWebSocketConnectFailure(clientRef[0], recieverPeer,
+                                            attemptGeneration, failureHandled,
+                                            connectionEstablished,
+                                            "WebSocket connect error: " + e.getMessage());
+                                } else if (roleState == RoleState.SENDER_SENDING) {
+                                    finishSenderAttempt("WebSocket transfer error: "
+                                            + e.getMessage());
                                 }
                             });
-
                         }
 
                         @Override
@@ -1357,21 +1545,97 @@ public class AirTransferService extends LifecycleService {
             clientRef[0] = client;
             webSocketClient = client;
             fileSender = new TransferFileSender(client);
+            websocketConnectTimeout = () -> {
+                if (operationGeneration == attemptGeneration
+                        && webSocketClient == client
+                        && roleState == RoleState.SENDER_CONNECTING
+                        && !connectionEstablished.get()) {
+                    handleWebSocketConnectFailure(client, recieverPeer,
+                            attemptGeneration, failureHandled, connectionEstablished,
+                            "WebSocket connect timed out");
+                }
+            };
+            mainHandler.postDelayed(websocketConnectTimeout,
+                    WEBSOCKET_CONNECT_ATTEMPT_TIMEOUT_MS);
             wsExecutor.execute(()->{
                 try{
                     client.connect();
                 } catch(Exception e){
-                    Log.e(TAG,"websocket connection failed"+e);
-                    mainHandler.post(()->{
-                        if (webSocketClient == client) {
-                            finishSenderAttempt("Could not connect to reciever");
-                        }
-                    });
+                    Log.e(TAG,"websocket connection failed",e);
+                    mainHandler.post(()->handleWebSocketConnectFailure(client,
+                            recieverPeer, attemptGeneration, failureHandled,
+                            connectionEstablished, "WebSocket connect error: "
+                                    + e.getMessage()));
                 }
             });
         } catch(Exception e){
             Log.e(TAG,"Invalid reciever address");
             finishSenderAttempt("Invalid reciever address");
+        }
+    }
+
+    private void handleWebSocketConnectFailure(
+            TransferWebSocketClient failedClient,
+            NSDTransferDiscovery.Peer peer,
+            long attemptGeneration,
+            AtomicBoolean failureHandled,
+            AtomicBoolean connectionEstablished,
+            String reason
+    ) {
+        if (operationGeneration != attemptGeneration
+                || webSocketClient != failedClient
+                || roleState != RoleState.SENDER_CONNECTING
+                || connectionEstablished.get()
+                || !failureHandled.compareAndSet(false, true)) {
+            return;
+        }
+
+        Log.w(TAG, "WebSocket connect attempt " + websocketConnectAttempts + "/"
+                + MAX_WEBSOCKET_CONNECT_ATTEMPTS + " failed for " + peer + ": " + reason);
+        cancelWebSocketConnectCallbacks();
+        webSocketClient = null;
+        if (fileSender != null) {
+            fileSender.shutdown();
+            fileSender = null;
+        }
+        try {
+            failedClient.close();
+        } catch (RuntimeException closeError) {
+            Log.w(TAG, "Could not close failed WebSocket attempt", closeError);
+        }
+
+        if (websocketConnectAttempts >= MAX_WEBSOCKET_CONNECT_ATTEMPTS) {
+            finishSenderAttempt("Could not connect to receiver after "
+                    + websocketConnectAttempts + " attempts: " + reason);
+            return;
+        }
+
+        setConnectionStatus("Connection attempt " + websocketConnectAttempts
+                + " failed; retrying");
+        setOverlayOperationStatus("Receiver is still advertised; retrying WebSocket connection");
+        showPeerStatus("Retrying receiver: " + formatPeer(peer));
+        websocketConnectRetry = () -> {
+            websocketConnectRetry = null;
+            if (operationGeneration != attemptGeneration
+                    || stopping
+                    || roleState != RoleState.SENDER_CONNECTING) {
+                return;
+            }
+            NSDTransferDiscovery.Peer currentPeer = pendingReciever == null
+                    ? peer : pendingReciever;
+            connectToReciever(currentPeer);
+        };
+        mainHandler.postDelayed(websocketConnectRetry, WEBSOCKET_CONNECT_RETRY_DELAY_MS);
+    }
+
+    private void cancelWebSocketConnectCallbacks() {
+        if (websocketConnectRetry != null) {
+            mainHandler.removeCallbacks(websocketConnectRetry);
+            websocketConnectRetry = null;
+        }
+        if (websocketConnectTimeout != null) {
+            mainHandler.removeCallbacks(websocketConnectTimeout);
+            websocketConnectTimeout = null;
         }
     }
 
@@ -1543,6 +1807,7 @@ public class AirTransferService extends LifecycleService {
         wsExecutor.shutdownNow();
 
         releaseCaptureResources(true);
+        clearTemporaryTransferFiles();
         super.onDestroy();
     }
 
@@ -1581,10 +1846,11 @@ public class AirTransferService extends LifecycleService {
         }
 
         Log.i(TAG, "Finishing sender attempt: " + message
-                + "; retaining MediaProjection=" + (mediaProjection != null));
+                + "; stopping service after attempt");
 
         operationGeneration++;
         senderDeadlineAtMs = 0L;
+        cancelWebSocketConnectCallbacks();
         mainHandler.removeCallbacks(senderTimeout);
         capturePending.set(false);
 
@@ -1616,7 +1882,7 @@ public class AirTransferService extends LifecycleService {
         showPeerStatus("No peer connected");
         setOverlayOperationStatus("Ready for gesture");
         showStatus(message);
-        resumeGestureCamera();
+        stopEverything(message, true);
     }
 
     private void releaseNetworkResources() {
@@ -1626,6 +1892,10 @@ public class AirTransferService extends LifecycleService {
         networkResourcesReleased = true;
         mainHandler.removeCallbacks(senderTimeout);
         mainHandler.removeCallbacks(receiverStartupTimeout);
+        if (receiverCompletionRunnable != null) {
+            mainHandler.removeCallbacks(receiverCompletionRunnable);
+            receiverCompletionRunnable = null;
+        }
         if(receiverIdleTimeout != null){
             mainHandler.removeCallbacks(receiverIdleTimeout);
             receiverIdleTimeout = null;
@@ -1637,9 +1907,12 @@ public class AirTransferService extends LifecycleService {
         pendingItemUri = null;
         pendingReciever = null;
         connectedSenderHost = null;
+        connectedSenderRemotePort = -1;
         connectedSenderIdentity = null;
         visibleSenderOffers.clear();
         receiverTransferCompleted.set(false);
+        receiverTransferStarted.set(false);
+        receiverTransferCommitting.set(false);
         setDiscoveryStatus("Idle");
         setConnectionStatus("Disconnected");
         setTransferStatus("Idle");
@@ -1654,15 +1927,17 @@ public class AirTransferService extends LifecycleService {
             recieverNsd.stopAll();
         }
         if (recieverServer != null) {
+            TransferWebSocketServer serverToStop = recieverServer;
+            recieverServer = null;
             try {
-                recieverServer.stop(1000);
+                serverToStop.stop(2000);
+                Log.i(TAG, "Receiver WebSocket server stopped before service teardown");
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                Log.w(TAG, "Interrupted while stopping receiver server.", e);
+                Log.w(TAG, "Interrupted while waiting for receiver server shutdown.", e);
             } catch (RuntimeException e) {
                 Log.w(TAG, "Could not stop receiver server cleanly.", e);
             }
-            recieverServer = null;
         }
         if (fileSender != null) {
             fileSender.shutdown();
@@ -1748,6 +2023,10 @@ public class AirTransferService extends LifecycleService {
             }
         }
         return null;
+    }
+
+    private boolean sameHost(String first, String second) {
+        return first != null && second != null && first.equalsIgnoreCase(second);
     }
 
     private String formatPeer(NSDTransferDiscovery.Peer peer) {

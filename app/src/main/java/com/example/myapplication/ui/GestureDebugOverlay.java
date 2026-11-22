@@ -11,8 +11,9 @@ import android.provider.Settings;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
-import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import com.example.myapplication.vision.HandGestureController;
@@ -25,7 +26,15 @@ public final class GestureDebugOverlay {
     private final WindowManager windowManager;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
+    public interface ControlListener {
+        void onCancelRequested();
+    }
+
     private TextView textView;
+    private Button cancelButton;
+    private LinearLayout rootView;
+    private ControlListener controlListener;
+    private boolean serviceRunning;
     private boolean attached;
     private HandGestureController.Observation latestObservation;
     private String serviceState = "STARTING";
@@ -39,6 +48,19 @@ public final class GestureDebugOverlay {
         this.context = context.getApplicationContext();
         this.windowManager = (WindowManager)
                 this.context.getSystemService(Context.WINDOW_SERVICE);
+    }
+
+    public void setControlListener(ControlListener listener) {
+        controlListener = listener;
+    }
+
+    public void setServiceRunning(boolean running) {
+        mainHandler.post(() -> {
+            serviceRunning = running;
+            if (cancelButton != null) {
+                cancelButton.setEnabled(running);
+            }
+        });
     }
 
     public void show() {
@@ -112,40 +134,67 @@ public final class GestureDebugOverlay {
             return;
         }
 
+        rootView = new LinearLayout(context);
+        rootView.setOrientation(LinearLayout.VERTICAL);
+        rootView.setPadding(dp(12), dp(9), dp(12), dp(9));
+
         textView = new TextView(context);
         textView.setTextColor(Color.WHITE);
         textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         textView.setTypeface(Typeface.MONOSPACE);
-        textView.setPadding(dp(12), dp(9), dp(12), dp(9));
         textView.setMaxLines(18);
-        textView.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+
+        LinearLayout controls = new LinearLayout(context);
+        controls.setOrientation(LinearLayout.HORIZONTAL);
+        controls.setGravity(Gravity.END);
+        controls.setPadding(0, dp(6), 0, 0);
+
+        cancelButton = new Button(context);
+        cancelButton.setText("Cancel");
+        cancelButton.setEnabled(serviceRunning);
+        cancelButton.setOnClickListener(view -> {
+            if (controlListener != null) {
+                controlListener.onCancelRequested();
+            }
+        });
+        controls.addView(cancelButton, new LinearLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT, dp(42)));
+
+        rootView.addView(textView, new LinearLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.WRAP_CONTENT));
+        rootView.addView(controls, new LinearLayout.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.WRAP_CONTENT));
 
         GradientDrawable background = new GradientDrawable();
         background.setColor(Color.argb(232, 13, 20, 30));
         background.setCornerRadius(dp(12));
         background.setStroke(dp(1), Color.argb(220, 89, 204, 255));
-        textView.setBackground(background);
+        rootView.setBackground(background);
 
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 dp(278),
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
         );
+        params.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
         params.gravity = Gravity.TOP | Gravity.END;
         params.x = dp(8);
         params.y = dp(72);
 
         try {
-            windowManager.addView(textView, params);
+            windowManager.addView(rootView, params);
             attached = true;
             render();
             Log.i(TAG, "Gesture diagnostics overlay attached");
         } catch (RuntimeException error) {
             textView = null;
+            cancelButton = null;
+            rootView = null;
             Log.e(TAG, "Could not attach gesture diagnostics overlay", error);
         }
     }
@@ -173,14 +222,16 @@ public final class GestureDebugOverlay {
     }
 
     private void removeOnMainThread() {
-        if (attached && textView != null && windowManager != null) {
+        if (attached && rootView != null && windowManager != null) {
             try {
-                windowManager.removeView(textView);
+                windowManager.removeView(rootView);
             } catch (RuntimeException error) {
                 Log.w(TAG, "Could not cleanly remove gesture diagnostics overlay", error);
             }
         }
         textView = null;
+        cancelButton = null;
+        rootView = null;
         attached = false;
     }
 

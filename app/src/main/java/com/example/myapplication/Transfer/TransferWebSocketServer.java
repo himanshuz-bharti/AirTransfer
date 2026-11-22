@@ -39,6 +39,7 @@ public class TransferWebSocketServer extends WebSocketServer{
 
     private OutputStream outputStream;
     private volatile WebSocket activeConnection;
+    private volatile boolean transferCommitting;
 
     private String chunkTransferId;
     private long chunkFileSize;
@@ -60,6 +61,8 @@ public class TransferWebSocketServer extends WebSocketServer{
         void onConnected(String remoteHost, int remotePort);
         void onDisconnected(String remoteHost, int remotePort);
         void onTransferActivity(long bytesReceived, long totalBytes);
+        void onTransferCommitting();
+        void onTransferCommitFailed(String reason);
     }
 
     public TransferWebSocketServer(Context appContext,int port, Path recieveDirectory){
@@ -73,12 +76,25 @@ public class TransferWebSocketServer extends WebSocketServer{
         String remoteHost = remoteHost(conn);
         int remotePort = remotePort(conn);
         Log.i(TAG,"Websocket client connected " + remoteHost + ":" + remotePort);
-        if (activeConnection != null && activeConnection != conn) {
-            Log.w(TAG, "Rejecting additional WebSocket client while a transfer session is active");
-            conn.close(1008, "Receiver is already in use");
-            return;
+        WebSocket previousConnection = activeConnection;
+        if (previousConnection != null && previousConnection != conn
+                && previousConnection.isOpen()) {
+            if (outputStream != null || transferCommitting) {
+                Log.w(TAG, "Rejecting additional WebSocket client while a transfer is active");
+                conn.close(1008, "Receiver is already transferring an image");
+                return;
+            }
+
+            // A stale NSD result or abandoned connection may occupy the receiver
+            // without ever starting a transfer. Let the newer client take over.
+            Log.i(TAG, "Replacing idle WebSocket connection from "
+                    + remoteHost(previousConnection) + ":" + remotePort(previousConnection));
         }
         activeConnection = conn;
+        if (previousConnection != null && previousConnection != conn
+                && previousConnection.isOpen()) {
+            previousConnection.close(1000, "Replaced by a new transfer connection");
+        }
         if (clientConnectionListener != null) {
             clientConnectionListener.onConnected(remoteHost, remotePort);
         }
@@ -164,20 +180,25 @@ public class TransferWebSocketServer extends WebSocketServer{
 
     @Override
     public void onClose(WebSocket conn,int code,String reason,boolean remote){
-        Log.i(TAG,"websocket disconnected");
+        Log.i(TAG, "WebSocket closed code=" + code + ", remote=" + remote
+                + ", reason=" + reason + ", peer=" + remoteHost(conn) + ":" + remotePort(conn));
         if (conn == activeConnection) {
             activeConnection = null;
-            abortTransfer();
+            if (!transferCommitting) {
+                abortTransfer();
+            }
             notifyClientDisconnected(conn);
         }
     }
 
     @Override
     public void onError(WebSocket conn,Exception e){
-        Log.e(TAG,"Websocket error:"+e.getMessage());
+        Log.e(TAG, "WebSocket error for peer=" + remoteHost(conn) + ":" + remotePort(conn), e);
         if (conn == activeConnection) {
             activeConnection = null;
-            abortTransfer();
+            if (!transferCommitting) {
+                abortTransfer();
+            }
             notifyClientDisconnected(conn);
         }
         e.printStackTrace();
@@ -189,6 +210,11 @@ public class TransferWebSocketServer extends WebSocketServer{
         if(serverStartedListener != null){
             serverStartedListener.run();
         }
+    }
+
+    public boolean hasActiveConnection() {
+        WebSocket connection = activeConnection;
+        return connection != null && connection.isOpen();
     }
 
     public void setTransferCompletedListener(TransferCompletedListener listener){
@@ -212,6 +238,18 @@ public class TransferWebSocketServer extends WebSocketServer{
     private void notifyTransferActivity(long bytesReceived, long totalBytes) {
         if (clientConnectionListener != null) {
             clientConnectionListener.onTransferActivity(bytesReceived, totalBytes);
+        }
+    }
+
+    private void notifyTransferCommitting() {
+        if (clientConnectionListener != null) {
+            clientConnectionListener.onTransferCommitting();
+        }
+    }
+
+    private void notifyTransferCommitFailed(String reason) {
+        if (clientConnectionListener != null) {
+            clientConnectionListener.onTransferCommitFailed(reason);
         }
     }
 
@@ -296,6 +334,7 @@ public class TransferWebSocketServer extends WebSocketServer{
     }
 
     private void handleEndMessage(WebSocket conn,String[] parts){
+        boolean committing = false;
         try{
             if(parts == null || parts.length<3){
                 throw new IOException("Invalid end message format");
@@ -319,23 +358,39 @@ public class TransferWebSocketServer extends WebSocketServer{
             }
 
             String displayName = finalFile.getFileName().toString();
+            notifyTransferCommitting();
+            committing = true;
+            transferCommitting = true;
             Uri finalImageUri = publishImageToPictures(chunkFile,displayName);
-            Files.deleteIfExists(chunkFile);
-            Log.i(TAG,"Transfer completed" + chunkTransferId +
+            try {
+                Files.deleteIfExists(chunkFile);
+            } catch (IOException cleanupError) {
+                // The gallery image is already published; temporary-file cleanup must not
+                // turn a successful image transfer into a failed protocol transaction.
+                Log.w(TAG, "Could not remove completed temporary image", cleanupError);
+            }
+            Log.i(TAG,"Transfer completed" + chunkTransferId+
                     "to gallery uri:"+ finalImageUri + "of size:" + finalSize);
 
-            String endMessage = TransferProtocol.DONE + "|" + chunkTransferId + "|" + chunkFileSize;
-            conn.send(endMessage);
-
+            // Record receiver-side success before acknowledging the sender. The sender can
+            // close immediately after receiving DONE, which may trigger onClose before any
+            // later completion callback and otherwise look like a failed receive.
             if(transferCompletedListener != null){
                 String mimeType = appContext.getContentResolver().getType(finalImageUri);
                 transferCompletedListener.onTransferCompleted(finalImageUri,
                         mimeType==null?"image/*":mimeType,displayName);
             }
-        } catch(IOException e){
+
+            String endMessage = TransferProtocol.DONE + "|" + chunkTransferId + "|" + chunkFileSize;
+            conn.send(endMessage);
+        } catch(Exception e){
             Log.e(TAG,"error occured in handleEndMessage"+e);
+            if (committing) {
+                notifyTransferCommitFailed(e.getMessage());
+            }
             conn.send(TransferProtocol.ERROR + "|" + e.getMessage());
         } finally {
+            transferCommitting = false;
             abortTransfer();
         }
     }
