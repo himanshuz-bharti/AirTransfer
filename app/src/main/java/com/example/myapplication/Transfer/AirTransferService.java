@@ -56,9 +56,7 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions;
 
-
-import java.io.File;
-
+import com.example.myapplication.utils.BitmapDumpUtil;
 
 public class AirTransferService extends LifecycleService {
 
@@ -164,6 +162,8 @@ public class AirTransferService extends LifecycleService {
     private Runnable websocketConnectTimeout;
     private Runnable senderDiscoveryRefresh;
     private boolean networkResourcesReleased;
+
+    private final AtomicBoolean overlayOnScreenDuringCapture = new AtomicBoolean(false);
 
     private final Runnable senderTimeout = () -> {
         if (!isSenderState()) {
@@ -1300,9 +1300,27 @@ public class AirTransferService extends LifecycleService {
 
         captureRequestGeneration = operationGeneration;
         capturePending.set(true);
+        overlayOnScreenDuringCapture.set(true);
+        mainHandler.post(this::hideOverlayForCleanCapture);
         return true;
     }
 
+    private void hideOverlayForCleanCapture(){
+        if(transferEffectOverlay!=null){
+            transferEffectOverlay.removeImmediately();
+        }
+        if(gestureDebugOverlay!=null){
+            gestureDebugOverlay.removeImmediately();
+        }
+        mainHandler.post(()->overlayOnScreenDuringCapture.set(false));
+    }
+
+    private void restoreOverlayAfterCleanup(){
+        if(gestureDebugOverlay!=null){
+            gestureDebugOverlay.show();
+        }
+        //transferEffectOverlay comes as the code calls transferEffectOverlay.show(Phase.CAPTURED) right after the frame is taken
+    }
     private void onImageAvailable(ImageReader reader){
         Image image = null;
         Bitmap bitmap = null;
@@ -1319,11 +1337,18 @@ public class AirTransferService extends LifecycleService {
                 return;
             }
 
+            if(overlayOnScreenDuringCapture.get()){
+                image.close();
+                return;
+            }
+
             if(!capturePending.compareAndSet(true,false)){
                 Log.i(TAG,"capturePending compare and set");
                 return;
             }
             requestGeneration = captureRequestGeneration;
+
+            mainHandler.post(this::restoreOverlayAfterCleanup);
 
             bitmap = imageToBitmap(image);
 
@@ -1337,7 +1362,7 @@ public class AirTransferService extends LifecycleService {
                 });
                 return;
             }
-
+          //  dumpImage(bitmap);
             Bitmap bitmapForMatching = bitmap.copy(Bitmap.Config.ARGB_8888,false);
             long capturedGeneration = requestGeneration;
             mainHandler.post(() -> {
@@ -2139,5 +2164,18 @@ public class AirTransferService extends LifecycleService {
             host = "[" + host + "]";
         }
         return name + " at " + host + ":" + peer.port;
+    }
+
+    private void dumpImage(Bitmap capturedImage){
+        if(capturedImage == null || capturedImage.isRecycled()){
+            Log.w(TAG,"Captured image is null or recycled");
+            return;
+        }
+        try{
+            Uri savedUri = BitmapDumpUtil.dumpBitmap(getApplicationContext(),capturedImage,"CaptureDump","debug_frame");
+            Log.i(TAG,"Captured dump saved "+savedUri);
+        } catch(IOException | RuntimeException error){
+            Log.e(TAG,"Error in duymping image",error);
+        }
     }
 }

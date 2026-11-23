@@ -235,6 +235,20 @@ public final class GestureDebugOverlay {
         attached = false;
     }
 
+    public void removeImmediately(){
+        if(attached && rootView != null && windowManager != null){
+            try{
+                windowManager.removeViewImmediate(rootView);
+            } catch(RuntimeException error){
+                Log.w(TAG, "Could not cleanly remove gesture diagnostics overlay", error);
+            }
+        }
+        textView = null;
+        cancelButton = null;
+        rootView = null;
+        attached = false;
+    }
+
     private int dp(float value) {
         return (int) (value * context.getResources().getDisplayMetrics().density + 0.5f);
     }
