@@ -239,5 +239,22 @@ public class TransferEffectOverlay {
         attached = false;
     }
 
+    public void removeImmediately(){
+        if(view!=null){
+            view.stopAnimation();
+        }
+
+        if(attached && view!=null && windowManager!=null){
+            try{
+                windowManager.removeViewImmediate(view);
+            } catch(RuntimeException e){
+
+            }
+        }
+
+        view = null;
+        attached = false;
+    }
+
 
 }

@@ -56,9 +56,7 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions;
 
-
-import java.io.File;
-
+import com.example.myapplication.utils.BitmapDumpUtil;
 
 public class AirTransferService extends LifecycleService {
 
@@ -163,7 +161,8 @@ public class AirTransferService extends LifecycleService {
     private Runnable websocketConnectRetry;
     private Runnable websocketConnectTimeout;
     private Runnable senderDiscoveryRefresh;
-    private boolean networkResourcesReleased;
+
+    private final AtomicBoolean overlayOnScreenDuringCapture = new AtomicBoolean(false);
 
     private final Runnable senderTimeout = () -> {
         if (!isSenderState()) {
@@ -635,6 +634,10 @@ public class AirTransferService extends LifecycleService {
             return;
         }
 
+        // The previous session's teardown stopped the sender-offer browse; restart
+        // it so this session sees nearby offers again.
+        offerNsd.startDiscovery();
+
         operationGeneration++;
         websocketConnectAttempts = 0;
         cancelWebSocketConnectCallbacks();
@@ -703,6 +706,10 @@ public class AirTransferService extends LifecycleService {
         if (roleState != RoleState.IDLE) {
             return;
         }
+
+        // The previous session's teardown stopped the sender-offer browse; restart
+        // it so this session sees nearby senders again.
+        offerNsd.startDiscovery();
 
         mainHandler.removeCallbacks(receiverStartupTimeout);
         receiverTransferCompleted.set(false);
@@ -1089,7 +1096,27 @@ public class AirTransferService extends LifecycleService {
         showPeerStatus("No peer connected");
         setOverlayOperationStatus("Ready for gesture");
         showStatus(message);
-        stopEverything(message, true);
+        endSession(message);
+    }
+
+    /**
+     * Ends the current transfer session but keeps the service alive and ready for
+     * the next gesture. The gesture camera, hand-gesture detection, and the
+     * screen-capture pipeline keep running; NSD and WebSocket resources are torn
+     * down exactly as before, and role state returns to IDLE so a new fist/palm
+     * gesture starts a fresh session without pressing Start again. The service
+     * itself only stops on an explicit user stop, a revoked screen-capture
+     * consent, or a fatal startup error (stopEverything).
+     */
+    private void endSession(String message){
+        if (stopping) {
+            return;
+        }
+        restoreOverlayAfterCleanup();
+        releaseNetworkResources();
+        clearTemporaryTransferFiles();
+        resumeGestureCamera();
+        Log.i(TAG, "Session ended; ready for the next gesture. (" + message + ")");
     }
 
 
@@ -1300,9 +1327,27 @@ public class AirTransferService extends LifecycleService {
 
         captureRequestGeneration = operationGeneration;
         capturePending.set(true);
+        overlayOnScreenDuringCapture.set(true);
+        mainHandler.post(this::hideOverlayForCleanCapture);
         return true;
     }
 
+    private void hideOverlayForCleanCapture(){
+        if(transferEffectOverlay!=null){
+            transferEffectOverlay.removeImmediately();
+        }
+        if(gestureDebugOverlay!=null){
+            gestureDebugOverlay.removeImmediately();
+        }
+        mainHandler.post(()->overlayOnScreenDuringCapture.set(false));
+    }
+
+    private void restoreOverlayAfterCleanup(){
+        if(gestureDebugOverlay!=null){
+            gestureDebugOverlay.show();
+        }
+        //transferEffectOverlay comes as the code calls transferEffectOverlay.show(Phase.CAPTURED) right after the frame is taken
+    }
     private void onImageAvailable(ImageReader reader){
         Image image = null;
         Bitmap bitmap = null;
@@ -1319,11 +1364,18 @@ public class AirTransferService extends LifecycleService {
                 return;
             }
 
+            if(overlayOnScreenDuringCapture.get()){
+                image.close();
+                return;
+            }
+
             if(!capturePending.compareAndSet(true,false)){
                 Log.i(TAG,"capturePending compare and set");
                 return;
             }
             requestGeneration = captureRequestGeneration;
+
+            mainHandler.post(this::restoreOverlayAfterCleanup);
 
             bitmap = imageToBitmap(image);
 
@@ -1337,7 +1389,7 @@ public class AirTransferService extends LifecycleService {
                 });
                 return;
             }
-
+          //  dumpImage(bitmap);
             Bitmap bitmapForMatching = bitmap.copy(Bitmap.Config.ARGB_8888,false);
             long capturedGeneration = requestGeneration;
             mainHandler.post(() -> {
@@ -1919,7 +1971,7 @@ public class AirTransferService extends LifecycleService {
         }
 
         Log.i(TAG, "Finishing sender attempt: " + message
-                + "; stopping service after attempt");
+                + "; ending session; service stays ready for the next gesture");
 
         operationGeneration++;
         senderDeadlineAtMs = 0L;
@@ -1956,14 +2008,10 @@ public class AirTransferService extends LifecycleService {
         showPeerStatus("No peer connected");
         setOverlayOperationStatus("Ready for gesture");
         showStatus(message);
-        stopEverything(message, true);
+        endSession(message);
     }
 
     private void releaseNetworkResources() {
-        if(networkResourcesReleased){
-            return;
-        }
-        networkResourcesReleased = true;
         cancelSenderDiscoveryRefresh();
         mainHandler.removeCallbacks(senderTimeout);
         mainHandler.removeCallbacks(receiverStartupTimeout);
@@ -2139,5 +2187,18 @@ public class AirTransferService extends LifecycleService {
             host = "[" + host + "]";
         }
         return name + " at " + host + ":" + peer.port;
+    }
+
+    private void dumpImage(Bitmap capturedImage){
+        if(capturedImage == null || capturedImage.isRecycled()){
+            Log.w(TAG,"Captured image is null or recycled");
+            return;
+        }
+        try{
+            Uri savedUri = BitmapDumpUtil.dumpBitmap(getApplicationContext(),capturedImage,"CaptureDump","debug_frame");
+            Log.i(TAG,"Captured dump saved "+savedUri);
+        } catch(IOException | RuntimeException error){
+            Log.e(TAG,"Error in duymping image",error);
+        }
     }
 }
